@@ -2,7 +2,7 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use stellarconduit_core::message::{
     signing::{sign_envelope, verify_signature},
-    types::TransactionEnvelope,
+    types::{ProtocolMessage, SyncRequest, TopologyUpdate, TransactionEnvelope},
 };
 
 fn make_test_envelope(keypair: &SigningKey, tx_xdr: &str) -> TransactionEnvelope {
@@ -17,7 +17,7 @@ fn make_test_envelope(keypair: &SigningKey, tx_xdr: &str) -> TransactionEnvelope
 }
 
 #[test]
-fn test_sign_and_verify_success() {
+fn test_sign_then_verify_passes() {
     let mut csprng = OsRng;
     let keypair = SigningKey::generate(&mut csprng);
     let mut envelope = make_test_envelope(&keypair, "AAAAAQAAAAAAAAAA");
@@ -64,7 +64,7 @@ fn test_verify_tampered_timestamp() {
 }
 
 #[test]
-fn test_verify_wrong_key() {
+fn test_verify_with_wrong_key_fails() {
     let mut csprng = OsRng;
     let keypair_a = SigningKey::generate(&mut csprng);
     let keypair_b = SigningKey::generate(&mut csprng);
@@ -98,5 +98,72 @@ fn test_verify_invalid_signature() {
     assert!(
         result.is_err(),
         "verification should fail with corrupted signature bytes"
+    );
+}
+
+// ─── Serialization Round-Trip Tests ──────────────────────────────────────────
+
+#[test]
+fn test_transaction_envelope_roundtrip() {
+    let mut csprng = OsRng;
+    let keypair = SigningKey::generate(&mut csprng);
+    let mut envelope = make_test_envelope(&keypair, "AAAAAQAAAAAAAAAA");
+    sign_envelope(&keypair, &mut envelope).expect("signing should succeed");
+
+    let msg = ProtocolMessage::Transaction(envelope);
+    let bytes = msg.to_bytes().expect("Failed to serialize");
+    let decoded = ProtocolMessage::from_bytes(&bytes).expect("Failed to deserialize");
+
+    assert_eq!(msg, decoded);
+}
+
+#[test]
+fn test_topology_update_roundtrip() {
+    let update = TopologyUpdate {
+        origin_pubkey: [7u8; 32],
+        directly_connected_peers: vec![[1u8; 32], [2u8; 32]],
+        hops_to_relay: 2,
+    };
+    let msg = ProtocolMessage::TopologyUpdate(update);
+
+    let bytes = msg.to_bytes().expect("Failed to serialize");
+    let decoded = ProtocolMessage::from_bytes(&bytes).expect("Failed to deserialize");
+
+    assert_eq!(msg, decoded);
+}
+
+#[test]
+fn test_sync_request_roundtrip() {
+    let req = SyncRequest {};
+    let msg = ProtocolMessage::SyncRequest(req);
+
+    let bytes = msg.to_bytes().expect("Failed to serialize");
+    let decoded = ProtocolMessage::from_bytes(&bytes).expect("Failed to deserialize");
+
+    assert_eq!(msg, decoded);
+}
+
+// ─── Size Budget Test ────────────────────────────────────────────────────────
+
+#[test]
+fn test_envelope_serialized_size_under_budget() {
+    let mut csprng = OsRng;
+    let keypair = SigningKey::generate(&mut csprng);
+
+    // Create a mock XDR string of around 300 bytes. Base64 is ~4 chars per 3 bytes.
+    // 280 bytes of raw data = ~373 chars of base64. Let's make a ~280 character string.
+    let mock_xdr = "AAAAAgAAAADZ/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9/7+9".to_string();
+
+    let mut envelope = make_test_envelope(&keypair, &mock_xdr);
+    sign_envelope(&keypair, &mut envelope).expect("signing should succeed");
+
+    let msg = ProtocolMessage::Transaction(envelope);
+    let bytes = msg.to_bytes().expect("Failed to serialize");
+
+    // The requirement is that a realistic envelope serialization should be < 500 bytes.
+    assert!(
+        bytes.len() < 500,
+        "Serialized envelope size {} must be under 500 bytes",
+        bytes.len()
     );
 }
