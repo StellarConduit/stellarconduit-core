@@ -3,6 +3,7 @@ pub mod gossip;
 pub mod message;
 pub mod peer;
 pub mod persistence;
+pub mod relay;
 pub mod topology;
 pub mod transport;
 
