@@ -42,6 +42,10 @@ hex = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 env_logger = "0.11"
 
+# Rate limiting
+governor = "0.6"
+nonzero_ext = "0.3"
+
 # BLE transport
 btleplug = "0.11"
 uuid = { version = "1.8", features = ["v4"] }
@@ -77,3 +81,7 @@ path = "tests/integration/relay_routing_test.rs"
 [[test]]
 name = "double_spend_simulation_test"
 path = "tests/integration/double_spend_simulation_test.rs"
+
+[[test]]
+name = "rate_limit_test"
+path = "tests/integration/rate_limit_test.rs"
