@@ -123,6 +123,7 @@ fn test_topology_update_roundtrip() {
         origin_pubkey: [7u8; 32],
         directly_connected_peers: vec![[1u8; 32], [2u8; 32]],
         hops_to_relay: 2,
+        topology_flags: vec![],
     };
     let msg = ProtocolMessage::TopologyUpdate(update);
 

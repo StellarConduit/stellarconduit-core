@@ -1,6 +1,6 @@
 use rand::random;
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const CHUNK_FRAME_HEADER_SIZE: usize = 14;
 pub const MAX_MESSAGE_SIZE_BYTES: usize = 1024 * 1024;
@@ -173,7 +173,21 @@ use crate::peer::identity::PeerIdentity;
 use crate::transport::ble_transport::BleCentral;
 use crate::transport::connection::Connection;
 use crate::transport::errors::TransportError;
+use crate::transport::power::{InterfacePowerState, PowerManager};
 use crate::transport::wifi_transport::WifiDirectConnection;
+
+#[derive(Debug, Clone, PartialEq)]
+struct PendingMessage {
+    peer: PeerIdentity,
+    message: ProtocolMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PowerTickOutcome {
+    pub interface_state: InterfacePowerState,
+    pub topology_flags: Vec<crate::message::types::TopologyFlag>,
+    pub flushed_transactions: usize,
+}
 
 /// Manages per-peer transport connections, automatically selecting the best
 /// available physical transport and falling back gracefully.
@@ -181,19 +195,34 @@ pub struct TransportManager {
     preference: TransportPreference,
     /// One `Box<dyn Connection>` per peer pubkey.
     active_connections: HashMap<[u8; 32], Box<dyn Connection>>,
+    power_manager: PowerManager,
+    pending_messages: VecDeque<PendingMessage>,
 }
 
 impl TransportManager {
     pub fn new(preference: TransportPreference) -> Self {
+        Self::with_power_manager(preference, PowerManager::new(current_unix_duration()))
+    }
+
+    pub fn with_power_manager(
+        preference: TransportPreference,
+        power_manager: PowerManager,
+    ) -> Self {
         Self {
             preference,
             active_connections: HashMap::new(),
+            power_manager,
+            pending_messages: VecDeque::new(),
         }
     }
 
     /// Number of currently active peer connections (test helper).
     pub fn connection_count(&self) -> usize {
         self.active_connections.len()
+    }
+
+    pub fn pending_message_count(&self) -> usize {
+        self.pending_messages.len()
     }
 
     /// Open a connection to `peer` using the best available transport.
@@ -257,30 +286,46 @@ impl TransportManager {
         peer: &PeerIdentity,
         msg: ProtocolMessage,
     ) -> Result<(), TransportError> {
-        if let Some(conn) = self.active_connections.get_mut(&peer.pubkey) {
-            match conn.send(msg.clone()).await {
-                Ok(()) => return Ok(()),
-                Err(TransportError::BrokenPipe) => {
-                    log::debug!("send_to: BrokenPipe — removing connection for peer");
-                    self.active_connections.remove(&peer.pubkey);
-                    // Attempt BLE fallback
-                    self.ble_fallback(peer.clone()).await?;
-                    // Retry send over the new BLE connection
-                    if let Some(conn) = self.active_connections.get_mut(&peer.pubkey) {
-                        return conn.send(msg).await;
-                    }
-                    return Err(TransportError::NotConnected);
-                }
-                Err(e) => return Err(e),
-            }
+        self.send_to_at(peer, msg, current_unix_duration()).await
+    }
+
+    pub async fn send_to_at(
+        &mut self,
+        peer: &PeerIdentity,
+        msg: ProtocolMessage,
+        now: Duration,
+    ) -> Result<(), TransportError> {
+        self.power_tick_at(now).await?;
+
+        if matches!(msg, ProtocolMessage::Transaction(_))
+            && self.power_manager.mode() == crate::transport::power::PowerMode::SynchronizedLowPower
+            && !self.power_manager.interface_state(now).ble_enabled
+        {
+            let _ = self.power_manager.record_outbound_transaction(now);
+            self.pending_messages.push_back(PendingMessage {
+                peer: peer.clone(),
+                message: msg,
+            });
+            return Ok(());
         }
-        Err(TransportError::NotConnected)
+
+        let _ = self.power_manager.record_outbound_transaction(now);
+        self.send_now(peer, msg).await
     }
 
     /// Poll each active connection for the next message.
     /// Returns the first `(PeerIdentity, ProtocolMessage)` received.
     /// On `BrokenPipe`, removes the failed connection and attempts BLE fallback.
     pub async fn recv_any(&mut self) -> Option<(PeerIdentity, ProtocolMessage)> {
+        self.recv_any_at(current_unix_duration()).await
+    }
+
+    pub async fn recv_any_at(&mut self, now: Duration) -> Option<(PeerIdentity, ProtocolMessage)> {
+        let tick = self.power_tick_at(now).await.ok()?;
+        if !tick.interface_state.ble_enabled && !tick.interface_state.wifi_enabled {
+            return None;
+        }
+
         let keys: Vec<[u8; 32]> = self.active_connections.keys().copied().collect();
 
         for pubkey in keys {
@@ -306,7 +351,12 @@ impl TransportManager {
             };
 
             match result {
-                Some(Ok(Ok(msg))) => return Some((peer, msg)),
+                Some(Ok(Ok(msg))) => {
+                    if matches!(msg, ProtocolMessage::Transaction(_)) {
+                        let _ = self.power_manager.record_incoming_transaction(now);
+                    }
+                    return Some((peer, msg));
+                }
                 Some(Ok(Err(TransportError::BrokenPipe))) => {
                     log::debug!("recv_any: BrokenPipe — falling back to BLE for peer");
                     self.active_connections.remove(&pubkey);
@@ -335,9 +385,56 @@ impl TransportManager {
         for (_, mut conn) in self.active_connections.drain() {
             let _ = conn.disconnect().await;
         }
+        self.pending_messages.clear();
+    }
+
+    pub async fn power_tick(&mut self) -> Result<PowerTickOutcome, TransportError> {
+        self.power_tick_at(current_unix_duration()).await
     }
 
     // ── Internal ─────────────────────────────────────────────────────────────
+
+    async fn power_tick_at(&mut self, now: Duration) -> Result<PowerTickOutcome, TransportError> {
+        let decision = self.power_manager.tick(now);
+        let mut flushed_transactions = 0usize;
+
+        if decision.wake_network {
+            while let Some(pending) = self.pending_messages.pop_front() {
+                self.send_now(&pending.peer, pending.message).await?;
+                flushed_transactions += 1;
+            }
+        }
+
+        Ok(PowerTickOutcome {
+            interface_state: decision.interface_state,
+            topology_flags: decision.topology_flags,
+            flushed_transactions,
+        })
+    }
+
+    async fn send_now(
+        &mut self,
+        peer: &PeerIdentity,
+        msg: ProtocolMessage,
+    ) -> Result<(), TransportError> {
+        if let Some(conn) = self.active_connections.get_mut(&peer.pubkey) {
+            match conn.send(msg.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(TransportError::BrokenPipe) => {
+                    log::debug!("send_to: BrokenPipe — removing connection for peer");
+                    self.active_connections.remove(&peer.pubkey);
+                    self.ble_fallback(peer.clone()).await?;
+                    if let Some(conn) = self.active_connections.get_mut(&peer.pubkey) {
+                        return conn.send(msg).await;
+                    }
+                    return Err(TransportError::NotConnected);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(TransportError::NotConnected)
+    }
 
     async fn ble_fallback(&mut self, peer: PeerIdentity) -> Result<(), TransportError> {
         log::debug!("ble_fallback: connecting via BLE for peer");
@@ -346,6 +443,12 @@ impl TransportManager {
         self.active_connections.insert(peer.pubkey, Box::new(c));
         Ok(())
     }
+}
+
+fn current_unix_duration() -> Duration {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -439,8 +542,17 @@ mod tests {
 
     // ── TransportManager tests ────────────────────────────────────────────────
 
-    use crate::message::types::{ProtocolMessage, TopologyUpdate};
+    use crate::message::types::{
+        ProtocolMessage, TopologyFlag, TopologyUpdate, TransactionEnvelope,
+    };
+    use crate::transport::connection::{ConnectionState, TransportType};
+    use crate::transport::power::{PowerManager, IDLE_SLEEP_TIMEOUT};
     use crate::transport::unified::{TransportManager, TransportPreference};
+    use async_trait::async_trait;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
     use tokio::net::TcpListener;
 
     fn peer(b: u8) -> PeerIdentity {
@@ -452,7 +564,79 @@ mod tests {
             origin_pubkey: [b; 32],
             directly_connected_peers: vec![],
             hops_to_relay: 1,
+            topology_flags: vec![],
         })
+    }
+
+    fn sample_transaction(b: u8) -> ProtocolMessage {
+        ProtocolMessage::Transaction(TransactionEnvelope {
+            message_id: [b; 32],
+            origin_pubkey: [b.wrapping_add(1); 32],
+            tx_xdr: format!("tx-{b}"),
+            ttl_hops: 4,
+            timestamp: 42,
+            signature: [0; 64],
+        })
+    }
+
+    struct MockConnection {
+        peer: PeerIdentity,
+        recv_calls: Arc<AtomicUsize>,
+        sent_messages: Arc<Mutex<Vec<ProtocolMessage>>>,
+        inbox: Arc<Mutex<Vec<ProtocolMessage>>>,
+    }
+
+    impl MockConnection {
+        fn new(
+            peer: PeerIdentity,
+            recv_calls: Arc<AtomicUsize>,
+            sent_messages: Arc<Mutex<Vec<ProtocolMessage>>>,
+            inbox: Arc<Mutex<Vec<ProtocolMessage>>>,
+        ) -> Self {
+            Self {
+                peer,
+                recv_calls,
+                sent_messages,
+                inbox,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Connection for MockConnection {
+        fn remote_peer(&self) -> PeerIdentity {
+            self.peer.clone()
+        }
+
+        fn transport_type(&self) -> TransportType {
+            TransportType::Ble
+        }
+
+        fn state(&self) -> ConnectionState {
+            ConnectionState::Connected
+        }
+
+        async fn connect(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn send(&mut self, msg: ProtocolMessage) -> Result<(), TransportError> {
+            self.sent_messages.lock().unwrap().push(msg);
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> Result<ProtocolMessage, TransportError> {
+            self.recv_calls.fetch_add(1, Ordering::SeqCst);
+            self.inbox
+                .lock()
+                .unwrap()
+                .pop()
+                .ok_or(TransportError::BrokenPipe)
+        }
+
+        async fn disconnect(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -565,5 +749,83 @@ mod tests {
         let mut server_conn = server_task.await.unwrap();
         let received = server_conn.recv().await.unwrap();
         assert_eq!(received, msg);
+    }
+
+    #[tokio::test]
+    async fn power_tick_emits_go_to_sleep_flag_after_idle_timeout() {
+        let mut mgr = TransportManager::with_power_manager(
+            TransportPreference::BleOnly,
+            PowerManager::new(Duration::from_secs(0)),
+        );
+
+        let tick = mgr.power_tick_at(IDLE_SLEEP_TIMEOUT).await.unwrap();
+        assert_eq!(tick.topology_flags, vec![TopologyFlag::GoToSleep]);
+        assert!(tick.interface_state.ble_enabled);
+    }
+
+    #[tokio::test]
+    async fn recv_any_skips_transport_polling_while_interfaces_sleep() {
+        let peer = peer(0x21);
+        let recv_calls = Arc::new(AtomicUsize::new(0));
+        let sent_messages = Arc::new(Mutex::new(Vec::new()));
+        let inbox = Arc::new(Mutex::new(vec![sample_msg(7)]));
+
+        let mut mgr = TransportManager::with_power_manager(
+            TransportPreference::BleOnly,
+            PowerManager::new(Duration::from_secs(0)),
+        );
+        mgr.active_connections.insert(
+            peer.pubkey,
+            Box::new(MockConnection::new(
+                peer.clone(),
+                recv_calls.clone(),
+                sent_messages,
+                inbox,
+            )),
+        );
+
+        let sleeping_at = IDLE_SLEEP_TIMEOUT + Duration::from_secs(1);
+        assert_eq!(mgr.recv_any_at(sleeping_at).await, None);
+        assert_eq!(recv_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sleeping_transactions_flush_on_next_awake_barrier() {
+        let peer = peer(0x44);
+        let recv_calls = Arc::new(AtomicUsize::new(0));
+        let sent_messages = Arc::new(Mutex::new(Vec::new()));
+        let inbox = Arc::new(Mutex::new(Vec::new()));
+
+        let mut mgr = TransportManager::with_power_manager(
+            TransportPreference::BleOnly,
+            PowerManager::new(Duration::from_secs(0)),
+        );
+        mgr.active_connections.insert(
+            peer.pubkey,
+            Box::new(MockConnection::new(
+                peer.clone(),
+                recv_calls,
+                sent_messages.clone(),
+                inbox,
+            )),
+        );
+
+        let sleeping_at = IDLE_SLEEP_TIMEOUT + Duration::from_secs(1);
+        let tx = sample_transaction(9);
+        mgr.send_to_at(&peer, tx.clone(), sleeping_at)
+            .await
+            .unwrap();
+
+        assert_eq!(mgr.pending_message_count(), 1);
+        assert!(sent_messages.lock().unwrap().is_empty());
+
+        let tick = mgr
+            .power_tick_at(IDLE_SLEEP_TIMEOUT + Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert_eq!(tick.flushed_transactions, 1);
+        assert_eq!(mgr.pending_message_count(), 0);
+        assert_eq!(sent_messages.lock().unwrap().as_slice(), &[tx]);
     }
 }

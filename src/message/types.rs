@@ -72,11 +72,18 @@ mod signature_serde {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TopologyFlag {
+    GoToSleep,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TopologyUpdate {
     pub origin_pubkey: [u8; 32],
     pub directly_connected_peers: Vec<[u8; 32]>,
     pub hops_to_relay: u8,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topology_flags: Vec<TopologyFlag>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

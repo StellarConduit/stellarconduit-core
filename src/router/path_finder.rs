@@ -118,11 +118,13 @@ mod tests {
             origin_pubkey: pk(2),
             directly_connected_peers: vec![pk(3)],
             hops_to_relay: 255, // unknown at origin
+            topology_flags: vec![],
         });
         graph.apply_update(&TopologyUpdate {
             origin_pubkey: pk(3),
             directly_connected_peers: vec![pk(4)],
             hops_to_relay: 255,
+            topology_flags: vec![],
         });
 
         hc.update_distance(pk(4), 1); // pk(4) is 1 hop away

@@ -279,6 +279,7 @@ mod tests {
             origin_pubkey: [b; 32],
             directly_connected_peers: vec![[0u8; 32], [1u8; 32]],
             hops_to_relay: 3,
+            topology_flags: vec![],
         })
     }
 

@@ -429,6 +429,7 @@ mod tests {
             origin_pubkey: [0u8; 32],
             directly_connected_peers: vec![],
             hops_to_relay: 0,
+            topology_flags: vec![],
         });
         assert_eq!(p.send(msg).await, Err(TransportError::NotConnected));
     }
@@ -441,6 +442,7 @@ mod tests {
             origin_pubkey: [0u8; 32],
             directly_connected_peers: vec![],
             hops_to_relay: 0,
+            topology_flags: vec![],
         });
         assert_eq!(c.send(msg).await, Err(TransportError::NotConnected));
     }
@@ -493,6 +495,7 @@ mod tests {
             origin_pubkey: [0xCCu8; 32],
             directly_connected_peers: vec![[0xAAu8; 32]],
             hops_to_relay: 2,
+            topology_flags: vec![],
         });
         let bytes = rmp_serde::to_vec(&msg).unwrap();
         let chunker = MessageChunker { mtu: BLE_ATT_MTU };

@@ -98,10 +98,10 @@ mod tests {
         let mut filter = SlidingBloomFilter::new(10, 0.01);
 
         // Add items until we reach capacity, accounting for false positives
-        let mut i = 0;
+        let mut i = 0u32;
         while filter.insert_count < 10 {
             let mut msg = [0u8; 32];
-            msg[0] = i as u8;
+            msg[0..4].copy_from_slice(&i.to_le_bytes());
             filter.check_and_add(&msg);
             i += 1;
         }
@@ -109,10 +109,13 @@ mod tests {
         // Verify insert_count is at capacity
         assert_eq!(filter.insert_count, 10);
 
-        // Next item triggers rotation — don't assert false (bloom filters are probabilistic)
-        let mut msg_next = [0u8; 32];
-        msg_next[0] = i as u8;
-        filter.check_and_add(&msg_next);
+        // Keep trying fresh IDs until one is truly inserted into the rotated window.
+        while filter.insert_count == 10 {
+            let mut msg_next = [0u8; 32];
+            msg_next[0..4].copy_from_slice(&i.to_le_bytes());
+            filter.check_and_add(&msg_next);
+            i += 1;
+        }
 
         // After rotation, insert_count should be 1
         assert_eq!(filter.insert_count, 1);
@@ -123,18 +126,20 @@ mod tests {
         assert!(filter.check_and_add(&msg0));
 
         // Add items until we trigger another rotation
-        i += 1;
         while filter.insert_count < 10 {
             let mut msg = [0u8; 32];
-            msg[0] = i as u8;
+            msg[0..4].copy_from_slice(&i.to_le_bytes());
             filter.check_and_add(&msg);
             i += 1;
         }
 
-        // Add one more item to trigger rotation
-        let mut msg_final = [0u8; 32];
-        msg_final[0] = i as u8;
-        filter.check_and_add(&msg_final);
+        // Same here: keep trying until a fresh item lands in the new window.
+        while filter.insert_count == 10 {
+            let mut msg_final = [0u8; 32];
+            msg_final[0..4].copy_from_slice(&i.to_le_bytes());
+            filter.check_and_add(&msg_final);
+            i += 1;
+        }
 
         // After the second rotation, insert_count resets to 1 (the last item of the batch
         // that triggered the rotate).
