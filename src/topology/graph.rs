@@ -90,6 +90,7 @@ mod tests {
             origin_pubkey: origin,
             directly_connected_peers: vec![pk(2), origin, pk(2)],
             hops_to_relay: 5,
+            topology_flags: vec![],
         };
         g.apply_update(&update);
         let neighbors = g.get_neighbors(&origin).cloned().unwrap();
@@ -105,6 +106,7 @@ mod tests {
             origin_pubkey: pk(1),
             directly_connected_peers: vec![pk(2)],
             hops_to_relay: 1,
+            topology_flags: vec![],
         };
         g.apply_update(&update);
         g.backdate_edge(&pk(1), Duration::from_secs(3700));
@@ -120,6 +122,7 @@ mod tests {
             origin_pubkey: pk(3),
             directly_connected_peers: vec![pk(4)],
             hops_to_relay: 1,
+            topology_flags: vec![],
         };
         g.apply_update(&update);
         // Edge is fresh — should NOT be pruned

@@ -200,6 +200,7 @@ mod tests {
                 origin_pubkey: pk(1),
                 directly_connected_peers: vec![pk(2)],
                 hops_to_relay: 1,
+                topology_flags: vec![],
             });
             // Backdate the edge to 2 hours ago
             g.backdate_edge(&pk(1), Duration::from_secs(7200));
@@ -227,6 +228,7 @@ mod tests {
                 origin_pubkey: pk(3),
                 directly_connected_peers: vec![pk(4)],
                 hops_to_relay: 2,
+                topology_flags: vec![],
             });
             // No backdating — edge is fresh
         }
