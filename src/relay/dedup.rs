@@ -28,17 +28,14 @@ impl RelayDeduplicator {
 
     /// Check if we've already processed this message_id.
     /// Returns Some(tx_hash) if already submitted, None if new.
+    ///
+    /// This method only checks the LRU cache, which stores the exact message_id -> tx_hash mapping.
+    /// The bloom filter is used in mark_submitted() to prevent duplicate additions to the cache.
+    /// If an item is not in the cache, we cannot return a hash, so we treat it as new.
     pub fn check(&mut self, message_id: &[u8; 32]) -> Option<String> {
-        // First check the LRU cache for an exact match
-        if let Some(hash) = self.result_cache.get(message_id) {
-            return Some(hash.clone());
-        }
-
-        // If not in cache, check the bloom filter
-        // If bloom filter says "probably seen" but not in cache, it's a false positive
-        // In that case, we treat it as new (return None)
-        // If bloom filter says "not seen", definitely return None
-        None
+        // Check the LRU cache for an exact match
+        // If found, return the cached transaction hash
+        self.result_cache.get(message_id).cloned()
     }
 
     /// Record that a message_id has been successfully submitted with the given tx hash.
