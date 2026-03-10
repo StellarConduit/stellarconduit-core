@@ -1,6 +1,5 @@
 /// Test to validate that the documentation in docs/message-format.md
 /// accurately reflects the implementation.
-
 use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
