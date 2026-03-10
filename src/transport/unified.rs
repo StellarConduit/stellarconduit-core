@@ -170,6 +170,8 @@ use std::net::SocketAddr;
 
 use crate::message::types::ProtocolMessage;
 use crate::peer::identity::PeerIdentity;
+use crate::security::events::SecurityEvent;
+use crate::security::rate_limit::RateLimiter;
 use crate::transport::ble_transport::BleCentral;
 use crate::transport::connection::Connection;
 use crate::transport::errors::TransportError;
@@ -181,6 +183,10 @@ pub struct TransportManager {
     preference: TransportPreference,
     /// One `Box<dyn Connection>` per peer pubkey.
     active_connections: HashMap<[u8; 32], Box<dyn Connection>>,
+    /// Rate limiter for ingress message protection
+    rate_limiter: RateLimiter,
+    /// Optional sender for security events (e.g., PeerViolation)
+    security_event_tx: Option<tokio::sync::broadcast::Sender<SecurityEvent>>,
 }
 
 impl TransportManager {
@@ -188,6 +194,22 @@ impl TransportManager {
         Self {
             preference,
             active_connections: HashMap::new(),
+            rate_limiter: RateLimiter::new(),
+            security_event_tx: None,
+        }
+    }
+
+    /// Create a new TransportManager with a security event sender for receiving
+    /// security events (e.g., PeerViolation).
+    pub fn with_security_events(
+        preference: TransportPreference,
+        event_tx: tokio::sync::broadcast::Sender<SecurityEvent>,
+    ) -> Self {
+        Self {
+            preference,
+            active_connections: HashMap::new(),
+            rate_limiter: RateLimiter::new(),
+            security_event_tx: Some(event_tx),
         }
     }
 
@@ -280,15 +302,43 @@ impl TransportManager {
     /// Poll each active connection for the next message.
     /// Returns the first `(PeerIdentity, ProtocolMessage)` received.
     /// On `BrokenPipe`, removes the failed connection and attempts BLE fallback.
+    /// Applies rate limiting to prevent DOS attacks from malicious peers.
     pub async fn recv_any(&mut self) -> Option<(PeerIdentity, ProtocolMessage)> {
         let keys: Vec<[u8; 32]> = self.active_connections.keys().copied().collect();
 
         for pubkey in keys {
-            let peer = if let Some(conn) = self.active_connections.get(&pubkey) {
-                conn.remote_peer()
+            let (peer, transport_type) = if let Some(conn) = self.active_connections.get(&pubkey) {
+                (conn.remote_peer(), conn.transport_type())
             } else {
                 continue;
             };
+
+            // Check rate limit before attempting to receive
+            match self.rate_limiter.check_rate_limit(&peer, transport_type) {
+                Ok(()) => {
+                    // Rate limit check passed, proceed with receiving
+                }
+                Err(should_ban) => {
+                    if should_ban {
+                        // Peer has exceeded violation threshold - emit event and disconnect
+                        log::warn!("Peer {} exceeded rate limit threshold, disconnecting", peer);
+                        if let Some(ref tx) = self.security_event_tx {
+                            let _ = tx.send(SecurityEvent::PeerViolation {
+                                peer: peer.clone(),
+                                reason: crate::security::events::ViolationReason::RateLimitExceeded,
+                            });
+                        }
+                        // Remove connection and rate limiter state
+                        self.active_connections.remove(&pubkey);
+                        self.rate_limiter.remove_peer(&peer);
+                        continue;
+                    } else {
+                        // Rate limited but not banned yet - drop this message silently
+                        log::debug!("Rate limit exceeded for peer {}, dropping message", peer);
+                        continue;
+                    }
+                }
+            }
 
             // We can't directly await on a &mut through the map, so use a temp approach.
             // NOTE: In production this would use tokio::select! across all connections.
@@ -310,6 +360,7 @@ impl TransportManager {
                 Some(Ok(Err(TransportError::BrokenPipe))) => {
                     log::debug!("recv_any: BrokenPipe — falling back to BLE for peer");
                     self.active_connections.remove(&pubkey);
+                    self.rate_limiter.remove_peer(&peer);
                     let _ = self.ble_fallback(peer).await;
                 }
                 _ => continue,
@@ -324,6 +375,9 @@ impl TransportManager {
     pub async fn disconnect_peer(&mut self, pubkey: &[u8; 32]) -> bool {
         if let Some(mut conn) = self.active_connections.remove(pubkey) {
             let _ = conn.disconnect().await;
+            // Clean up rate limiter state
+            let peer = conn.remote_peer();
+            self.rate_limiter.remove_peer(&peer);
             true
         } else {
             false
@@ -335,6 +389,7 @@ impl TransportManager {
         for (_, mut conn) in self.active_connections.drain() {
             let _ = conn.disconnect().await;
         }
+        self.rate_limiter.clear();
     }
 
     // ── Internal ─────────────────────────────────────────────────────────────
