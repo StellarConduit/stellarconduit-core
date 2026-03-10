@@ -96,6 +96,56 @@ impl PeerList {
             p.last_seen_unix_sec = ts;
         }
     }
+
+    /// Ban a peer for the specified duration (in seconds).
+    /// Returns true if the peer was found and banned.
+    pub fn ban_peer(&mut self, pubkey: &[u8; 32], duration_sec: u64) -> bool {
+        if let Some(peer) = self.peers.get_mut(pubkey) {
+            peer.ban(duration_sec);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if a peer is currently banned.
+    /// Note: This does not check expiration. Use check_ban_expirations() to update expired bans.
+    pub fn is_peer_banned(&self, pubkey: &[u8; 32]) -> bool {
+        self.peers.get(pubkey).map(|p| p.is_banned).unwrap_or(false)
+    }
+
+    /// Unban a peer immediately.
+    pub fn unban_peer(&mut self, pubkey: &[u8; 32]) -> bool {
+        if let Some(peer) = self.peers.get_mut(pubkey) {
+            peer.is_banned = false;
+            peer.ban_expires_at_unix_sec = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check and update ban expiration for all peers.
+    /// Returns a list of peer identities that were unbanned.
+    pub fn check_ban_expirations(&mut self) -> Vec<crate::peer::identity::PeerIdentity> {
+        let mut unbanned = Vec::new();
+        for peer in self.peers.values_mut() {
+            if peer.check_ban_expiration() {
+                unbanned.push(peer.identity.clone());
+            }
+        }
+        unbanned
+    }
+
+    /// Get a peer by pubkey (mutable).
+    pub fn get_peer_mut(&mut self, pubkey: &[u8; 32]) -> Option<&mut Peer> {
+        self.peers.get_mut(pubkey)
+    }
+
+    /// Get a peer by pubkey.
+    pub fn get_peer(&self, pubkey: &[u8; 32]) -> Option<&Peer> {
+        self.peers.get(pubkey)
+    }
 }
 
 /// Background pruning stub — call this on a Tokio task to auto-prune every `interval_secs`.

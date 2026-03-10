@@ -319,6 +319,17 @@ impl TransportManager {
         None
     }
 
+    /// Disconnect a specific peer by pubkey.
+    /// Returns true if the peer was connected and disconnected.
+    pub async fn disconnect_peer(&mut self, pubkey: &[u8; 32]) -> bool {
+        if let Some(mut conn) = self.active_connections.remove(pubkey) {
+            let _ = conn.disconnect().await;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Disconnect all active connections and clear the map.
     pub async fn shutdown(&mut self) {
         for (_, mut conn) in self.active_connections.drain() {

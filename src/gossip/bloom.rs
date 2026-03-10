@@ -43,6 +43,20 @@ impl SlidingBloomFilter {
         }
     }
 
+    /// Check if a message_id is probably seen (without adding it)
+    pub fn check(&self, message_id: &[u8; 32]) -> bool {
+        self.current.check(message_id) || self.previous.check(message_id)
+    }
+
+    /// Add a message_id to the filter (without checking first)
+    pub fn add(&mut self, message_id: &[u8; 32]) {
+        if !self.check(message_id) {
+            self.rotate_if_full();
+            self.current.set(message_id);
+            self.insert_count += 1;
+        }
+    }
+
     pub fn check_and_add(&mut self, message_id: &[u8; 32]) -> bool {
         if self.current.check(message_id) || self.previous.check(message_id) {
             true
@@ -83,31 +97,44 @@ mod tests {
     fn test_sliding_bloom_filter_rotation() {
         let mut filter = SlidingBloomFilter::new(10, 0.01);
 
-        // Add 10 items to fill current filter
-        for i in 0..10 {
+        // Add items until we reach capacity, accounting for false positives
+        let mut i = 0;
+        while filter.insert_count < 10 {
             let mut msg = [0u8; 32];
             msg[0] = i as u8;
-            assert!(!filter.check_and_add(&msg));
+            filter.check_and_add(&msg);
+            i += 1;
         }
 
+        // Verify insert_count is at capacity
+        assert_eq!(filter.insert_count, 10);
+
         // Next item triggers rotation — don't assert false (bloom filters are probabilistic)
-        let mut msg11 = [0u8; 32];
-        msg11[0] = 11;
-        filter.check_and_add(&msg11);
+        let mut msg_next = [0u8; 32];
+        msg_next[0] = i as u8;
+        filter.check_and_add(&msg_next);
+
+        // After rotation, insert_count should be 1
+        assert_eq!(filter.insert_count, 1);
 
         // Old items should still be recognized (they are now in previous)
         let mut msg0 = [0u8; 32];
         msg0[0] = 0;
         assert!(filter.check_and_add(&msg0));
 
-        // Add 10 more items to cause another rotation (12..22 = items 12 to 21 inclusive)
-        // Note: we don't assert false on each since bloom filters have a small false-positive
-        // rate. We just drive the rotation logic.
-        for i in 12..22 {
+        // Add items until we trigger another rotation
+        i += 1;
+        while filter.insert_count < 10 {
             let mut msg = [0u8; 32];
             msg[0] = i as u8;
             filter.check_and_add(&msg);
+            i += 1;
         }
+
+        // Add one more item to trigger rotation
+        let mut msg_final = [0u8; 32];
+        msg_final[0] = i as u8;
+        filter.check_and_add(&msg_final);
 
         // After the second rotation, insert_count resets to 1 (the last item of the batch
         // that triggered the rotate).

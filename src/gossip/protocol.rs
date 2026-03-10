@@ -1,14 +1,22 @@
 //! Gossip protocol event loop and anti-entropy sync.
 
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 
+use crate::discovery::peer_list::PeerList;
+use crate::gossip::queue::PriorityQueue;
 use crate::gossip::round::{GossipScheduler, ACTIVE_ROUND_INTERVAL_MS, IDLE_ROUND_INTERVAL_MS};
-use crate::message::types::{SyncRequest, SyncResponse, TransactionEnvelope};
+use crate::gossip::strike_tracker::StrikeTracker;
+use crate::message::signing::verify_signature;
+use crate::message::types::{ProtocolMessage, SyncRequest, SyncResponse, TransactionEnvelope};
+use crate::peer::identity::PeerIdentity;
+use crate::transport::unified::TransportManager;
 
 #[derive(Default)]
 pub struct GossipState {
-    pub active_envelopes: Vec<TransactionEnvelope>,
+    pub active_queue: PriorityQueue,
 }
 
 impl GossipState {
@@ -18,14 +26,14 @@ impl GossipState {
 
     /// Add an envelope to the active buffer
     pub fn add_envelope(&mut self, env: TransactionEnvelope) {
-        self.active_envelopes.push(env);
+        self.active_queue.push(ProtocolMessage::Transaction(env));
     }
 
     /// Generates a SyncRequest containing the 4-byte prefixes of known message IDs
     pub fn generate_sync_request(&self) -> SyncRequest {
         let known_message_ids = self
-            .active_envelopes
-            .iter()
+            .active_queue
+            .iter_envelopes()
             .map(|env| {
                 let mut prefix = [0u8; 4];
                 prefix.copy_from_slice(&env.message_id[0..4]);
@@ -40,8 +48,8 @@ impl GossipState {
     /// that the requestor does not have.
     pub fn handle_sync_request(&self, req: &SyncRequest) -> SyncResponse {
         let missing_envelopes = self
-            .active_envelopes
-            .iter()
+            .active_queue
+            .iter_envelopes()
             .filter(|env| {
                 let mut prefix = [0u8; 4];
                 prefix.copy_from_slice(&env.message_id[0..4]);
@@ -53,17 +61,83 @@ impl GossipState {
         SyncResponse { missing_envelopes }
     }
 
-    /// Process an incoming SyncResponse by adding the missing envelopes to our state
+    /// Process an incoming SyncResponse by adding the missing envelopes to our state.
+    /// Note: Signature verification should be done via process_transaction_envelope before calling this.
     pub fn handle_sync_response(&mut self, resp: SyncResponse) {
         for env in resp.missing_envelopes {
-            // Ideally we'd verify signatures and dedupe here before adding
             self.add_envelope(env);
         }
     }
 }
 
-pub async fn run_gossip_loop(mut scheduler: GossipScheduler) {
+/// Process an incoming TransactionEnvelope, verifying its signature and tracking failures.
+/// Returns Ok(()) if the envelope is valid, Err(PeerIdentity) if the peer should be banned.
+pub async fn process_transaction_envelope(
+    envelope: &TransactionEnvelope,
+    strike_tracker: &mut StrikeTracker,
+    peer_list: Arc<Mutex<PeerList>>,
+    transport_manager: Arc<Mutex<TransportManager>>,
+) -> Result<(), PeerIdentity> {
+    // Verify the signature
+    match verify_signature(envelope) {
+        Ok(true) => {
+            // Valid signature - clear any strikes for this peer
+            let peer_identity = PeerIdentity::new(envelope.origin_pubkey);
+            strike_tracker.clear_peer(&peer_identity);
+            Ok(())
+        }
+        Ok(false) => {
+            // This shouldn't happen - verify_signature returns Err on failure
+            Ok(())
+        }
+        Err(_) => {
+            // Invalid signature - record the failure
+            let peer_identity = PeerIdentity::new(envelope.origin_pubkey);
+            let should_ban = strike_tracker.record_failure(&peer_identity);
+
+            if should_ban {
+                // Ban the peer for 24 hours
+                const BAN_DURATION_SEC: u64 = 24 * 60 * 60; // 24 hours
+                let mut peer_list_guard = peer_list.lock().await;
+                // Ensure peer exists in the list before banning
+                if peer_list_guard.get_peer(&peer_identity.pubkey).is_none() {
+                    peer_list_guard.insert_or_update(peer_identity.pubkey, 0);
+                }
+                peer_list_guard.ban_peer(&peer_identity.pubkey, BAN_DURATION_SEC);
+                drop(peer_list_guard);
+
+                // Disconnect the peer
+                let mut transport_guard = transport_manager.lock().await;
+                transport_guard.disconnect_peer(&peer_identity.pubkey).await;
+                drop(transport_guard);
+
+                log::warn!(
+                    "Banned peer {} for sending {} invalid signatures",
+                    peer_identity,
+                    strike_tracker.get_strike_count(&peer_identity)
+                );
+
+                Err(peer_identity)
+            } else {
+                log::debug!(
+                    "Invalid signature from peer {} (strike count: {})",
+                    peer_identity,
+                    strike_tracker.get_strike_count(&peer_identity)
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+pub async fn run_gossip_loop(
+    mut scheduler: GossipScheduler,
+    mut strike_tracker: StrikeTracker,
+    peer_list: Arc<Mutex<PeerList>>,
+    _transport_manager: Arc<Mutex<TransportManager>>,
+) {
     let mut _anti_entropy_timer = tokio::time::interval(Duration::from_secs(30));
+    let mut ban_check_timer = tokio::time::interval(Duration::from_secs(60)); // Check ban expiration every minute
 
     loop {
         tokio::select! {
@@ -86,6 +160,19 @@ pub async fn run_gossip_loop(mut scheduler: GossipScheduler) {
             _ = _anti_entropy_timer.tick() => {
                 log::debug!("Anti-entropy sync timer fired");
                 // TODO: Pick one random active peer and send state.generate_sync_request()
+            }
+
+            // Check ban expiration periodically
+            _ = ban_check_timer.tick() => {
+                let mut peer_list_guard = peer_list.lock().await;
+                let unbanned = peer_list_guard.check_ban_expirations();
+                if !unbanned.is_empty() {
+                    log::info!("Unbanned {} peer(s) after expiration", unbanned.len());
+                    // Clear strike tracker for unbanned peers
+                    for peer in unbanned {
+                        strike_tracker.clear_peer(&peer);
+                    }
+                }
             }
         }
     }
@@ -144,21 +231,41 @@ mod tests {
     #[test]
     fn test_handle_sync_response() {
         let mut state = GossipState::new();
-        assert_eq!(state.active_envelopes.len(), 0);
+        assert_eq!(state.active_queue.len(), 0);
 
         let resp = SyncResponse {
             missing_envelopes: vec![mock_envelope(0xCC)],
         };
 
         state.handle_sync_response(resp);
-        assert_eq!(state.active_envelopes.len(), 1);
-        assert_eq!(state.active_envelopes[0].message_id[0], 0xCC);
+        assert_eq!(state.active_queue.len(), 1);
+        assert_eq!(
+            state
+                .active_queue
+                .iter_envelopes()
+                .next()
+                .unwrap()
+                .message_id[0],
+            0xCC
+        );
     }
 
     #[tokio::test]
     async fn test_gossip_loop_starts_without_blocking() {
         let scheduler = GossipScheduler::new();
-        let handle = tokio::spawn(run_gossip_loop(scheduler));
+        let strike_tracker = StrikeTracker::new();
+        let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
+        let transport_manager = Arc::new(Mutex::new(
+            crate::transport::unified::TransportManager::new(
+                crate::transport::unified::TransportPreference::BleOnly,
+            ),
+        ));
+        let handle = tokio::spawn(run_gossip_loop(
+            scheduler,
+            strike_tracker,
+            peer_list,
+            transport_manager,
+        ));
         let result = timeout(Duration::from_millis(200), async {
             tokio::time::sleep(Duration::from_millis(100)).await;
         })
@@ -170,7 +277,19 @@ mod tests {
     #[tokio::test]
     async fn test_gossip_loop_can_be_aborted() {
         let scheduler = GossipScheduler::new();
-        let handle = tokio::spawn(run_gossip_loop(scheduler));
+        let strike_tracker = StrikeTracker::new();
+        let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
+        let transport_manager = Arc::new(Mutex::new(
+            crate::transport::unified::TransportManager::new(
+                crate::transport::unified::TransportPreference::BleOnly,
+            ),
+        ));
+        let handle = tokio::spawn(run_gossip_loop(
+            scheduler,
+            strike_tracker,
+            peer_list,
+            transport_manager,
+        ));
         tokio::time::sleep(Duration::from_millis(50)).await;
         handle.abort();
         let _ = handle.await;
@@ -183,7 +302,19 @@ mod tests {
         scheduler.last_active_msg_time =
             std::time::Instant::now() - Duration::from_secs(IDLE_TIMEOUT_SEC + 5);
         assert!(scheduler.is_idle());
-        let handle = tokio::spawn(run_gossip_loop(scheduler));
+        let strike_tracker = StrikeTracker::new();
+        let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
+        let transport_manager = Arc::new(Mutex::new(
+            crate::transport::unified::TransportManager::new(
+                crate::transport::unified::TransportPreference::BleOnly,
+            ),
+        ));
+        let handle = tokio::spawn(run_gossip_loop(
+            scheduler,
+            strike_tracker,
+            peer_list,
+            transport_manager,
+        ));
         let result = timeout(Duration::from_millis(150), async {
             tokio::time::sleep(Duration::from_millis(50)).await;
         })

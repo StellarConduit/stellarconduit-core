@@ -1,4 +1,5 @@
 pub mod discovery;
+pub mod ffi;
 pub mod gossip;
 pub mod message;
 pub mod peer;
