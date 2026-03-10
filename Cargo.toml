@@ -73,3 +73,7 @@ path = "tests/integration/relay_routing_test.rs"
 [[test]]
 name = "double_spend_simulation_test"
 path = "tests/integration/double_spend_simulation_test.rs"
+
+[[test]]
+name = "partition_merge_test"
+path = "tests/integration/partition_merge_test.rs"

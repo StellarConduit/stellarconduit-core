@@ -5,17 +5,73 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
+use std::collections::HashMap;
+
 use crate::discovery::peer_list::PeerList;
 use crate::gossip::round::{GossipScheduler, ACTIVE_ROUND_INTERVAL_MS, IDLE_ROUND_INTERVAL_MS};
 use crate::gossip::strike_tracker::StrikeTracker;
 use crate::message::signing::verify_signature;
-use crate::message::types::{SyncRequest, SyncResponse, TransactionEnvelope};
+use crate::message::types::{
+    PartitionMergeHandshake, PartitionMergeHandshakeResponse, SyncRequest, SyncResponse,
+    TransactionEnvelope,
+};
 use crate::peer::identity::PeerIdentity;
 use crate::transport::unified::TransportManager;
+
+/// Rate limiting parameters for partition merge dampening
+#[derive(Debug, Clone)]
+pub struct MergeRateLimit {
+    /// Maximum number of messages to send per batch
+    pub batch_size: u32,
+    /// Delay in milliseconds between batches
+    pub batch_delay_ms: u64,
+    /// Whether rate limiting is currently active
+    pub is_active: bool,
+}
+
+impl Default for MergeRateLimit {
+    fn default() -> Self {
+        Self {
+            batch_size: 100,     // Default: send 100 messages per batch
+            batch_delay_ms: 100, // Default: 100ms delay between batches
+            is_active: false,
+        }
+    }
+}
+
+/// Tracks partition merge state per peer
+#[derive(Default)]
+pub struct PartitionMergeTracker {
+    /// Maps peer pubkey to their rate limiting parameters
+    rate_limits: HashMap<[u8; 32], MergeRateLimit>,
+}
+
+impl PartitionMergeTracker {
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    /// Set rate limiting parameters for a peer
+    pub fn set_rate_limit(&mut self, peer_pubkey: [u8; 32], rate_limit: MergeRateLimit) {
+        self.rate_limits.insert(peer_pubkey, rate_limit);
+    }
+
+    /// Get rate limiting parameters for a peer
+    pub fn get_rate_limit(&self, peer_pubkey: &[u8; 32]) -> Option<&MergeRateLimit> {
+        self.rate_limits.get(peer_pubkey)
+    }
+
+    /// Clear rate limiting for a peer (when merge is complete)
+    pub fn clear_rate_limit(&mut self, peer_pubkey: &[u8; 32]) {
+        self.rate_limits.remove(peer_pubkey);
+    }
+}
 
 #[derive(Default)]
 pub struct GossipState {
     pub active_envelopes: Vec<TransactionEnvelope>,
+    /// Tracks partition merge state for rate limiting
+    pub merge_tracker: PartitionMergeTracker,
 }
 
 impl GossipState {
@@ -44,9 +100,9 @@ impl GossipState {
     }
 
     /// Processes an incoming SyncRequest, returning a SyncResponse with any local envelopes
-    /// that the requestor does not have.
-    pub fn handle_sync_request(&self, req: &SyncRequest) -> SyncResponse {
-        let missing_envelopes = self
+    /// that the requestor does not have. Applies rate limiting if partition merge is active.
+    pub fn handle_sync_request(&self, req: &SyncRequest, peer_pubkey: &[u8; 32]) -> SyncResponse {
+        let mut missing_envelopes: Vec<TransactionEnvelope> = self
             .active_envelopes
             .iter()
             .filter(|env| {
@@ -57,6 +113,19 @@ impl GossipState {
             .cloned()
             .collect();
 
+        // Apply rate limiting if partition merge is active for this peer
+        if let Some(rate_limit) = self.merge_tracker.get_rate_limit(peer_pubkey) {
+            if rate_limit.is_active && missing_envelopes.len() > rate_limit.batch_size as usize {
+                // Limit the number of messages in this batch
+                missing_envelopes.truncate(rate_limit.batch_size as usize);
+                log::info!(
+                    "Partition merge dampening: limiting sync response to {} messages (out of {} total) for peer",
+                    rate_limit.batch_size,
+                    self.active_envelopes.len()
+                );
+            }
+        }
+
         SyncResponse { missing_envelopes }
     }
 
@@ -65,6 +134,119 @@ impl GossipState {
     pub fn handle_sync_response(&mut self, resp: SyncResponse) {
         for env in resp.missing_envelopes {
             self.add_envelope(env);
+        }
+    }
+
+    /// Generate a partition merge handshake message with current cluster statistics
+    pub fn generate_partition_merge_handshake(
+        &self,
+        estimated_peer_count: u32,
+    ) -> PartitionMergeHandshake {
+        PartitionMergeHandshake {
+            estimated_cluster_message_count: self.active_envelopes.len() as u32,
+            estimated_cluster_peer_count: estimated_peer_count,
+        }
+    }
+
+    /// Handle an incoming partition merge handshake and determine if rate limiting is needed
+    pub fn handle_partition_merge_handshake(
+        &mut self,
+        handshake: &PartitionMergeHandshake,
+        peer_pubkey: [u8; 32],
+        local_peer_count: u32,
+    ) -> PartitionMergeHandshakeResponse {
+        let local_message_count = self.active_envelopes.len() as u32;
+        let remote_message_count = handshake.estimated_cluster_message_count;
+        let remote_peer_count = handshake.estimated_cluster_peer_count;
+
+        // Detect if this is a large partition merge scenario
+        // Threshold: if either cluster has >100 messages and the difference is significant
+        const LARGE_MERGE_THRESHOLD: u32 = 100;
+        const SIGNIFICANT_DIFFERENCE_RATIO: f64 = 0.3; // 30% difference
+
+        let total_messages = local_message_count + remote_message_count;
+        let message_difference = local_message_count.abs_diff(remote_message_count);
+
+        let needs_dampening = total_messages > LARGE_MERGE_THRESHOLD
+            && (message_difference as f64 / total_messages as f64) > SIGNIFICANT_DIFFERENCE_RATIO;
+
+        let (batch_size, batch_delay_ms) = if needs_dampening {
+            // Calculate rate limits based on cluster sizes
+            // Larger clusters need more aggressive throttling
+            let max_cluster_size = local_peer_count.max(remote_peer_count);
+            let batch_size = if max_cluster_size > 100 {
+                50 // Very large clusters: 50 messages per batch
+            } else if max_cluster_size > 50 {
+                100 // Large clusters: 100 messages per batch
+            } else {
+                200 // Medium clusters: 200 messages per batch
+            };
+
+            // Delay increases with cluster size
+            let batch_delay_ms = if max_cluster_size > 100 {
+                500 // Very large clusters: 500ms delay
+            } else if max_cluster_size > 50 {
+                200 // Large clusters: 200ms delay
+            } else {
+                100 // Medium clusters: 100ms delay
+            };
+
+            log::info!(
+                "Partition merge detected: local={} msgs/{} peers, remote={} msgs/{} peers. Applying dampening: batch_size={}, delay={}ms",
+                local_message_count,
+                local_peer_count,
+                remote_message_count,
+                remote_peer_count,
+                batch_size,
+                batch_delay_ms
+            );
+
+            // Set rate limiting for this peer
+            self.merge_tracker.set_rate_limit(
+                peer_pubkey,
+                MergeRateLimit {
+                    batch_size,
+                    batch_delay_ms,
+                    is_active: true,
+                },
+            );
+
+            (batch_size, batch_delay_ms)
+        } else {
+            // No dampening needed
+            (1000, 10) // Large batch size, minimal delay
+        };
+
+        PartitionMergeHandshakeResponse {
+            estimated_cluster_message_count: local_message_count,
+            estimated_cluster_peer_count: local_peer_count,
+            batch_size,
+            batch_delay_ms,
+        }
+    }
+
+    /// Handle partition merge handshake response and apply rate limiting if needed
+    pub fn handle_partition_merge_handshake_response(
+        &mut self,
+        response: &PartitionMergeHandshakeResponse,
+        peer_pubkey: [u8; 32],
+    ) {
+        // Apply the rate limiting parameters from the peer's response
+        if response.batch_size < 1000 || response.batch_delay_ms > 10 {
+            // Peer is requesting rate limiting
+            self.merge_tracker.set_rate_limit(
+                peer_pubkey,
+                MergeRateLimit {
+                    batch_size: response.batch_size,
+                    batch_delay_ms: response.batch_delay_ms,
+                    is_active: true,
+                },
+            );
+            log::info!(
+                "Applied partition merge rate limiting from peer: batch_size={}, delay={}ms",
+                response.batch_size,
+                response.batch_delay_ms
+            );
         }
     }
 }
@@ -221,7 +403,8 @@ mod tests {
         let req = node_b.generate_sync_request();
 
         // Node A processes request and calculates what B is missing
-        let resp = node_a.handle_sync_request(&req);
+        let peer_pubkey = [0u8; 32];
+        let resp = node_a.handle_sync_request(&req, &peer_pubkey);
 
         assert_eq!(resp.missing_envelopes.len(), 1);
         assert_eq!(resp.missing_envelopes[0].message_id[0], 0xBB);

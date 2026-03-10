@@ -92,6 +92,29 @@ pub struct SyncResponse {
     pub missing_envelopes: Vec<TransactionEnvelope>,
 }
 
+/// Partition merge handshake message sent when connecting to a peer from a different partition.
+/// This allows both sides to detect large message count differences and apply rate limiting.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PartitionMergeHandshake {
+    /// Estimated number of messages in this node's cluster
+    pub estimated_cluster_message_count: u32,
+    /// Number of active peers in this node's cluster (for estimating cluster size)
+    pub estimated_cluster_peer_count: u32,
+}
+
+/// Partition merge handshake response acknowledging the merge and agreeing on rate limits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PartitionMergeHandshakeResponse {
+    /// Estimated number of messages in the responding node's cluster
+    pub estimated_cluster_message_count: u32,
+    /// Number of active peers in the responding node's cluster
+    pub estimated_cluster_peer_count: u32,
+    /// Maximum number of messages to send per batch during merge
+    pub batch_size: u32,
+    /// Delay in milliseconds between batches
+    pub batch_delay_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ProtocolMessage {
     /// A new or propagated transaction envelope
@@ -105,6 +128,12 @@ pub enum ProtocolMessage {
 
     /// A response containing missing messages requested via SyncRequest
     SyncResponse(SyncResponse),
+
+    /// Partition merge handshake to detect and dampen large cluster merges
+    PartitionMergeHandshake(PartitionMergeHandshake),
+
+    /// Response to partition merge handshake with rate limiting parameters
+    PartitionMergeHandshakeResponse(PartitionMergeHandshakeResponse),
 }
 
 impl ProtocolMessage {
