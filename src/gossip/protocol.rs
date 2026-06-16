@@ -203,10 +203,11 @@ pub async fn run_gossip_loop(
     mut scheduler: GossipScheduler,
     mut strike_tracker: StrikeTracker,
     peer_list: Arc<Mutex<PeerList>>,
-    _transport_manager: Arc<Mutex<TransportManager>>,
+    transport_manager: Arc<Mutex<TransportManager>>,
+    state: Arc<Mutex<GossipState>>,
 ) {
-    let mut _anti_entropy_timer = tokio::time::interval(Duration::from_secs(30));
-    let mut ban_check_timer = tokio::time::interval(Duration::from_secs(60)); // Check ban expiration every minute
+    let mut anti_entropy_timer = tokio::time::interval(Duration::from_secs(30));
+    let mut ban_check_timer = tokio::time::interval(Duration::from_secs(60));
 
     loop {
         tokio::select! {
@@ -226,9 +227,68 @@ pub async fn run_gossip_loop(
             }
 
             // Anti-entropy pull interval (every 30 seconds)
-            _ = _anti_entropy_timer.tick() => {
+            _ = anti_entropy_timer.tick() => {
                 log::debug!("Anti-entropy sync timer fired");
-                // TODO: Pick one random active peer and send state.generate_sync_request()
+
+                // Pick one random active peer
+                let maybe_peer = {
+                    let peer_list_guard = peer_list.lock().await;
+                    let active = peer_list_guard.get_active_peers();
+                    if active.is_empty() {
+                        None
+                    } else {
+                        use rand::seq::SliceRandom;
+                        active.choose(&mut rand::thread_rng()).map(|p| p.identity.clone())
+                    }
+                };
+
+                if let Some(peer) = maybe_peer {
+                    let sync_req = {
+                        let state_guard = state.lock().await;
+                        state_guard.generate_sync_request()
+                    };
+
+                    log::debug!("Sending SyncRequest to peer {}", peer);
+
+                    let send_result = {
+                        let mut tm = transport_manager.lock().await;
+                        tm.send_to(&peer, crate::message::types::ProtocolMessage::SyncRequest(sync_req)).await
+                    };
+
+                    match send_result {
+                        Ok(()) => {
+                            // Wait for SyncResponse from this peer
+                            let response = {
+                                let mut tm = transport_manager.lock().await;
+                                tokio::time::timeout(
+                                    Duration::from_secs(10),
+                                    tm.recv_any(),
+                                ).await
+                            };
+
+                            match response {
+                                Ok(Some((_responding_peer, crate::message::types::ProtocolMessage::SyncResponse(resp)))) => {
+                                    log::debug!(
+                                        "Anti-entropy: received {} missing envelope(s) from peer {}",
+                                        resp.missing_envelopes.len(),
+                                        peer
+                                    );
+                                    let mut state_guard = state.lock().await;
+                                    state_guard.handle_sync_response(resp);
+                                }
+                                Ok(Some(_)) => {
+                                    log::debug!("Anti-entropy: received non-SyncResponse message, ignoring");
+                                }
+                                Ok(None) | Err(_) => {
+                                    log::debug!("Anti-entropy: no response from peer {} within timeout", peer);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::debug!("Anti-entropy: failed to send SyncRequest to peer {}: {:?}", peer, e);
+                        }
+                    }
+                }
             }
 
             // Check ban expiration periodically
@@ -237,7 +297,6 @@ pub async fn run_gossip_loop(
                 let unbanned = peer_list_guard.check_ban_expirations();
                 if !unbanned.is_empty() {
                     log::info!("Unbanned {} peer(s) after expiration", unbanned.len());
-                    // Clear strike tracker for unbanned peers
                     for peer in unbanned {
                         strike_tracker.clear_peer(&peer);
                     }
@@ -319,21 +378,26 @@ mod tests {
         );
     }
 
+    fn make_transport() -> Arc<Mutex<crate::transport::unified::TransportManager>> {
+        Arc::new(Mutex::new(
+            crate::transport::unified::TransportManager::new(
+                crate::transport::unified::TransportPreference::BleOnly,
+            ),
+        ))
+    }
+
     #[tokio::test]
     async fn test_gossip_loop_starts_without_blocking() {
         let scheduler = GossipScheduler::new();
         let strike_tracker = StrikeTracker::new();
         let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
-        let transport_manager = Arc::new(Mutex::new(
-            crate::transport::unified::TransportManager::new(
-                crate::transport::unified::TransportPreference::BleOnly,
-            ),
-        ));
+        let state = Arc::new(Mutex::new(GossipState::new()));
         let handle = tokio::spawn(run_gossip_loop(
             scheduler,
             strike_tracker,
             peer_list,
-            transport_manager,
+            make_transport(),
+            state,
         ));
         let result = timeout(Duration::from_millis(200), async {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -348,16 +412,13 @@ mod tests {
         let scheduler = GossipScheduler::new();
         let strike_tracker = StrikeTracker::new();
         let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
-        let transport_manager = Arc::new(Mutex::new(
-            crate::transport::unified::TransportManager::new(
-                crate::transport::unified::TransportPreference::BleOnly,
-            ),
-        ));
+        let state = Arc::new(Mutex::new(GossipState::new()));
         let handle = tokio::spawn(run_gossip_loop(
             scheduler,
             strike_tracker,
             peer_list,
-            transport_manager,
+            make_transport(),
+            state,
         ));
         tokio::time::sleep(Duration::from_millis(50)).await;
         handle.abort();
@@ -373,16 +434,13 @@ mod tests {
         assert!(scheduler.is_idle());
         let strike_tracker = StrikeTracker::new();
         let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
-        let transport_manager = Arc::new(Mutex::new(
-            crate::transport::unified::TransportManager::new(
-                crate::transport::unified::TransportPreference::BleOnly,
-            ),
-        ));
+        let state = Arc::new(Mutex::new(GossipState::new()));
         let handle = tokio::spawn(run_gossip_loop(
             scheduler,
             strike_tracker,
             peer_list,
-            transport_manager,
+            make_transport(),
+            state,
         ));
         let result = timeout(Duration::from_millis(150), async {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -390,5 +448,101 @@ mod tests {
         .await;
         assert!(result.is_ok());
         handle.abort();
+    }
+
+    // ─── Anti-entropy pull tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_anti_entropy_no_peers_skips_sync() {
+        // With an empty peer list, anti-entropy should do nothing (no panic)
+        let state = GossipState::new();
+        // generate_sync_request on empty state returns empty known_ids
+        let req = state.generate_sync_request();
+        assert_eq!(req.known_message_ids.len(), 0);
+    }
+
+    #[test]
+    fn test_anti_entropy_sync_request_contains_all_known_ids() {
+        let mut state = GossipState::new();
+        state.add_envelope(mock_envelope(0x01));
+        state.add_envelope(mock_envelope(0x02));
+        state.add_envelope(mock_envelope(0x03));
+
+        let req = state.generate_sync_request();
+        assert_eq!(req.known_message_ids.len(), 3);
+
+        // Each prefix should match the first 4 bytes of the message_id
+        let prefixes: Vec<[u8; 4]> = vec![[0x01; 4], [0x02; 4], [0x03; 4]];
+        for prefix in &prefixes {
+            assert!(req.known_message_ids.contains(prefix));
+        }
+    }
+
+    #[test]
+    fn test_anti_entropy_handle_sync_response_merges_missing() {
+        let mut local = GossipState::new();
+        local.add_envelope(mock_envelope(0xAA));
+
+        let mut remote = GossipState::new();
+        remote.add_envelope(mock_envelope(0xAA));
+        remote.add_envelope(mock_envelope(0xBB));
+        remote.add_envelope(mock_envelope(0xCC));
+
+        // Simulate what the remote peer would send back
+        let req = local.generate_sync_request();
+        let resp = remote.handle_sync_request(&req);
+
+        // Remote should report the 2 envelopes local is missing
+        assert_eq!(resp.missing_envelopes.len(), 2);
+
+        // Local merges the response
+        local.handle_sync_response(resp);
+        assert_eq!(local.active_queue.len(), 3);
+    }
+
+    #[test]
+    fn test_anti_entropy_sync_response_no_duplicates() {
+        let mut state = GossipState::new();
+        state.add_envelope(mock_envelope(0x10));
+        state.add_envelope(mock_envelope(0x20));
+
+        // Receiving a response that contains an envelope we already have
+        let resp = SyncResponse {
+            missing_envelopes: vec![mock_envelope(0x30)],
+        };
+        state.handle_sync_response(resp);
+
+        // Should now have 3 envelopes (no duplicates added)
+        assert_eq!(state.active_queue.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_gossip_loop_with_state_param_starts_cleanly() {
+        let scheduler = GossipScheduler::new();
+        let strike_tracker = StrikeTracker::new();
+        let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
+        let state = Arc::new(Mutex::new(GossipState::new()));
+
+        // Pre-populate state to verify it's passed through correctly
+        {
+            let mut s = state.lock().await;
+            s.add_envelope(mock_envelope(0xFF));
+        }
+
+        let state_clone = Arc::clone(&state);
+        let handle = tokio::spawn(run_gossip_loop(
+            scheduler,
+            strike_tracker,
+            peer_list,
+            make_transport(),
+            state_clone,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.abort();
+
+        // State should still be accessible and intact after loop is aborted
+        let s = state.lock().await;
+        assert_eq!(s.active_queue.len(), 1);
     }
 }
