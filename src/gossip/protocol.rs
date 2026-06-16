@@ -1,5 +1,6 @@
 //! Gossip protocol event loop and anti-entropy sync.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -14,9 +15,23 @@ use crate::message::types::{ProtocolMessage, SyncRequest, SyncResponse, Transact
 use crate::peer::identity::PeerIdentity;
 use crate::transport::unified::TransportManager;
 
+/// Threshold above which a SyncResponse is treated as a "macro-merge" event.
+/// This is tuned for large mesh clusters where immediately ingesting thousands
+/// of envelopes would cause a broadcast storm.
+const MACRO_MERGE_THRESHOLD: usize = 500;
+
+/// Maximum number of envelopes to pull from a macro-merge backlog in a single
+/// recovery step. Higher values speed up convergence but risk overloading
+/// constrained links; lower values are safer but slower.
+pub const MACRO_MERGE_BATCH_SIZE: usize = 50;
+
 #[derive(Default)]
 pub struct GossipState {
     pub active_queue: PriorityQueue,
+    /// Backlog of envelopes discovered via a macro-merge SyncResponse.
+    /// These are inserted into the active queue gradually to avoid
+    /// overwhelming constrained transports.
+    macro_merge_backlog: VecDeque<TransactionEnvelope>,
 }
 
 impl GossipState {
@@ -27,6 +42,38 @@ impl GossipState {
     /// Add an envelope to the active buffer
     pub fn add_envelope(&mut self, env: TransactionEnvelope) {
         self.active_queue.push(ProtocolMessage::Transaction(env));
+    }
+
+    /// Returns the number of envelopes currently waiting in the macro-merge
+    /// backlog. This is primarily used by tests and higher-level schedulers
+    /// to drive paced recovery.
+    pub fn pending_macro_merge_len(&self) -> usize {
+        self.macro_merge_backlog.len()
+    }
+
+    /// Drains up to `batch_size` envelopes from the macro-merge backlog into
+    /// the active queue, returning the number of envelopes actually moved.
+    ///
+    /// Envelopes in the backlog are ordered by increasing `timestamp`
+    /// (oldest first) so that we preferentially recover the oldest
+    /// transactions before they expire, while still respecting the QoS
+    /// prioritization implemented by `PriorityQueue`.
+    pub fn process_paced_recovery_batch(&mut self, batch_size: usize) -> usize {
+        if batch_size == 0 {
+            return 0;
+        }
+
+        let mut moved = 0usize;
+        while moved < batch_size {
+            if let Some(env) = self.macro_merge_backlog.pop_front() {
+                self.add_envelope(env);
+                moved += 1;
+            } else {
+                break;
+            }
+        }
+
+        moved
     }
 
     /// Generates a SyncRequest containing the 4-byte prefixes of known message IDs
@@ -62,11 +109,33 @@ impl GossipState {
     }
 
     /// Process an incoming SyncResponse by adding the missing envelopes to our state.
+    ///
+    /// - For small deltas (<= MACRO_MERGE_THRESHOLD), envelopes are added
+    ///   immediately to the active queue as before.
+    /// - For large deltas (> MACRO_MERGE_THRESHOLD), we treat this as a
+    ///   "macro-merge" between two large clusters. Instead of immediately
+    ///   enqueuing all envelopes (which would cause a broadcast storm),
+    ///   we move them into a backlog ordered by age and let a paced
+    ///   recovery loop drain them in small batches.
+    ///
     /// Note: Signature verification should be done via process_transaction_envelope before calling this.
     pub fn handle_sync_response(&mut self, resp: SyncResponse) {
-        for env in resp.missing_envelopes {
-            self.add_envelope(env);
+        // Fast path for regular anti-entropy syncs.
+        if resp.missing_envelopes.len() <= MACRO_MERGE_THRESHOLD {
+            for env in resp.missing_envelopes {
+                self.add_envelope(env);
+            }
+            return;
         }
+
+        // Macro-merge path: sort by timestamp so that oldest transactions
+        // are recovered first, then push into the backlog for paced recovery.
+        let mut backlog: Vec<TransactionEnvelope> = resp.missing_envelopes;
+        backlog.sort_by_key(|env| env.timestamp);
+
+        // Replace any existing backlog — a new macro-merge response supersedes
+        // prior partial backlogs from the same peer/cluster.
+        self.macro_merge_backlog = backlog.into();
     }
 }
 
