@@ -171,6 +171,7 @@ fn test_protocol_message_variants() {
         origin_pubkey: [2u8; 32],
         directly_connected_peers: vec![[3u8; 32], [4u8; 32]],
         hops_to_relay: 5,
+        topology_flags: vec![],
     };
 
     let sync_req = SyncRequest {

@@ -77,6 +77,46 @@ impl SlidingBloomFilter {
     }
 }
 
+/// Public-facing bloom filter with a `&[u8]` API and a configurable capacity.
+/// This is the type referenced by integration tests as `BloomFilter`.
+pub struct BloomFilter {
+    inner: bloomfilter::Bloom<Vec<u8>>,
+    capacity: usize,
+    fp_rate: f64,
+    insert_count: usize,
+    previous: bloomfilter::Bloom<Vec<u8>>,
+}
+
+impl BloomFilter {
+    pub fn new(capacity: usize) -> Self {
+        let fp_rate = 0.01;
+        Self {
+            inner: bloomfilter::Bloom::new_for_fp_rate(capacity.max(1), fp_rate),
+            previous: bloomfilter::Bloom::new_for_fp_rate(capacity.max(1), fp_rate),
+            capacity,
+            fp_rate,
+            insert_count: 0,
+        }
+    }
+
+    /// Returns `true` if the message was probably already seen, `false` if definitely new.
+    /// Rotates the underlying filter when capacity is reached.
+    pub fn check_and_add(&mut self, message: &[u8]) -> bool {
+        let key = message.to_vec();
+        if self.inner.check(&key) || self.previous.check(&key) {
+            return true;
+        }
+        if self.insert_count >= self.capacity {
+            let fresh = bloomfilter::Bloom::new_for_fp_rate(self.capacity.max(1), self.fp_rate);
+            self.previous = std::mem::replace(&mut self.inner, fresh);
+            self.insert_count = 0;
+        }
+        self.inner.set(&key);
+        self.insert_count += 1;
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
