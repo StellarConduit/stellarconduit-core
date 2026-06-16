@@ -44,6 +44,23 @@ impl FanoutCalculator {
             .clamp(self.min_fanout, self.max_fanout)
             .min(active_connections)
     }
+
+    /// Simplified API: calculate fanout target from active connection count only.
+    pub fn calculate_target(&self, active_connections: usize) -> usize {
+        self.calculate(active_connections, None)
+    }
+
+    /// Select `f` random items from a slice of `T: Clone`.
+    pub fn select_random<T: Clone>(&self, items: &[T], f: usize) -> Vec<T> {
+        if items.is_empty() || f == 0 {
+            return Vec::new();
+        }
+        let mut rng = rand::thread_rng();
+        items
+            .choose_multiple(&mut rng, f.min(items.len()))
+            .cloned()
+            .collect()
+    }
 }
 
 impl Default for FanoutCalculator {

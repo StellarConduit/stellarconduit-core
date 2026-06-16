@@ -57,6 +57,48 @@ impl Default for GossipScheduler {
     }
 }
 
+/// Public-facing scheduler alias used by integration tests.
+/// Wraps `GossipScheduler` and exposes `get_interval` / `advance_time`.
+pub struct RoundScheduler {
+    inner: GossipScheduler,
+    /// Accumulated virtual time offset for testing.
+    time_offset: Duration,
+}
+
+impl RoundScheduler {
+    pub fn new() -> Self {
+        Self {
+            inner: GossipScheduler::new(),
+            time_offset: Duration::ZERO,
+        }
+    }
+
+    pub fn record_activity(&mut self) {
+        self.inner.record_activity();
+    }
+
+    /// Returns the current gossip round interval.
+    pub fn get_interval(&self) -> Duration {
+        // If a virtual time offset has pushed us past the idle threshold, report idle interval.
+        if self.time_offset >= Duration::from_secs(IDLE_TIMEOUT_SEC) {
+            Duration::from_millis(IDLE_ROUND_INTERVAL_MS)
+        } else {
+            self.inner.current_interval()
+        }
+    }
+
+    /// Advance the virtual clock by `delta` (used in tests to simulate time passing).
+    pub fn advance_time(&mut self, delta: Duration) {
+        self.time_offset += delta;
+    }
+}
+
+impl Default for RoundScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

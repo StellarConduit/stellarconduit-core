@@ -202,11 +202,13 @@ pub async fn process_transaction_envelope(
 pub async fn run_gossip_loop(
     mut scheduler: GossipScheduler,
     mut strike_tracker: StrikeTracker,
+    state: Arc<Mutex<GossipState>>,
     peer_list: Arc<Mutex<PeerList>>,
-    _transport_manager: Arc<Mutex<TransportManager>>,
+    transport_manager: Arc<Mutex<TransportManager>>,
 ) {
-    let mut _anti_entropy_timer = tokio::time::interval(Duration::from_secs(30));
-    let mut ban_check_timer = tokio::time::interval(Duration::from_secs(60)); // Check ban expiration every minute
+    let mut anti_entropy_timer = tokio::time::interval(Duration::from_secs(30));
+    let mut ban_check_timer = tokio::time::interval(Duration::from_secs(60));
+    let fanout_calc = crate::gossip::fanout::FanoutCalculator::new();
 
     loop {
         tokio::select! {
@@ -219,16 +221,78 @@ pub async fn run_gossip_loop(
                 }
             )) => {
                 if scheduler.is_time_for_round() {
-                    // TODO: select fanout peers and broadcast buffered messages
-                    log::debug!("Gossip round fired");
+                    // Epidemic broadcast fanout: dequeue buffered messages and push
+                    // to a randomly selected subset of active peers.
+                    let active_peers: Vec<crate::peer::identity::PeerIdentity> = {
+                        let pl = peer_list.lock().await;
+                        pl.get_active_peers()
+                            .iter()
+                            .map(|p| p.identity.clone())
+                            .collect()
+                    };
+
+                    if !active_peers.is_empty() {
+                        let fanout = fanout_calc.calculate(active_peers.len(), None);
+                        let targets = crate::gossip::fanout::select_random_peers(&active_peers, fanout);
+
+                        // Drain all messages from the active queue for this round
+                        let messages: Vec<crate::message::types::ProtocolMessage> = {
+                            let mut gs = state.lock().await;
+                            // Also move a paced recovery batch into the active queue
+                            gs.process_paced_recovery_batch(MACRO_MERGE_BATCH_SIZE);
+                            let mut msgs = Vec::new();
+                            while let Some(msg) = gs.active_queue.pop() {
+                                msgs.push(msg);
+                            }
+                            msgs
+                        };
+
+                        if !messages.is_empty() {
+                            let mut tm = transport_manager.lock().await;
+                            for peer in &targets {
+                                for msg in &messages {
+                                    if let Err(e) = tm.send_to(peer, msg.clone()).await {
+                                        log::debug!("Gossip fanout send error to {}: {:?}", peer, e);
+                                    }
+                                }
+                            }
+                            scheduler.record_activity();
+                            log::debug!(
+                                "Gossip round: pushed {} message(s) to {} peer(s)",
+                                messages.len(),
+                                targets.len()
+                            );
+                        }
+                    }
+
                     scheduler.round_executed();
                 }
             }
 
             // Anti-entropy pull interval (every 30 seconds)
-            _ = _anti_entropy_timer.tick() => {
+            _ = anti_entropy_timer.tick() => {
                 log::debug!("Anti-entropy sync timer fired");
-                // TODO: Pick one random active peer and send state.generate_sync_request()
+                let active_peers: Vec<crate::peer::identity::PeerIdentity> = {
+                    let pl = peer_list.lock().await;
+                    pl.get_active_peers()
+                        .iter()
+                        .map(|p| p.identity.clone())
+                        .collect()
+                };
+                if !active_peers.is_empty() {
+                    let targets = crate::gossip::fanout::select_random_peers(&active_peers, 1);
+                    if let Some(peer) = targets.first() {
+                        let sync_req = {
+                            let gs = state.lock().await;
+                            gs.generate_sync_request()
+                        };
+                        let mut tm = transport_manager.lock().await;
+                        let _ = tm.send_to(
+                            peer,
+                            crate::message::types::ProtocolMessage::SyncRequest(sync_req),
+                        ).await;
+                    }
+                }
             }
 
             // Check ban expiration periodically
@@ -237,7 +301,6 @@ pub async fn run_gossip_loop(
                 let unbanned = peer_list_guard.check_ban_expirations();
                 if !unbanned.is_empty() {
                     log::info!("Unbanned {} peer(s) after expiration", unbanned.len());
-                    // Clear strike tracker for unbanned peers
                     for peer in unbanned {
                         strike_tracker.clear_peer(&peer);
                     }
@@ -319,19 +382,31 @@ mod tests {
         );
     }
 
+    fn make_loop_args() -> (
+        GossipScheduler,
+        StrikeTracker,
+        Arc<Mutex<GossipState>>,
+        Arc<Mutex<PeerList>>,
+        Arc<Mutex<crate::transport::unified::TransportManager>>,
+    ) {
+        (
+            GossipScheduler::new(),
+            StrikeTracker::new(),
+            Arc::new(Mutex::new(GossipState::new())),
+            Arc::new(Mutex::new(PeerList::new(300))),
+            Arc::new(Mutex::new(crate::transport::unified::TransportManager::new(
+                crate::transport::unified::TransportPreference::BleOnly,
+            ))),
+        )
+    }
+
     #[tokio::test]
     async fn test_gossip_loop_starts_without_blocking() {
-        let scheduler = GossipScheduler::new();
-        let strike_tracker = StrikeTracker::new();
-        let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
-        let transport_manager = Arc::new(Mutex::new(
-            crate::transport::unified::TransportManager::new(
-                crate::transport::unified::TransportPreference::BleOnly,
-            ),
-        ));
+        let (scheduler, strike_tracker, state, peer_list, transport_manager) = make_loop_args();
         let handle = tokio::spawn(run_gossip_loop(
             scheduler,
             strike_tracker,
+            state,
             peer_list,
             transport_manager,
         ));
@@ -345,17 +420,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_gossip_loop_can_be_aborted() {
-        let scheduler = GossipScheduler::new();
-        let strike_tracker = StrikeTracker::new();
-        let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
-        let transport_manager = Arc::new(Mutex::new(
-            crate::transport::unified::TransportManager::new(
-                crate::transport::unified::TransportPreference::BleOnly,
-            ),
-        ));
+        let (scheduler, strike_tracker, state, peer_list, transport_manager) = make_loop_args();
         let handle = tokio::spawn(run_gossip_loop(
             scheduler,
             strike_tracker,
+            state,
             peer_list,
             transport_manager,
         ));
@@ -367,20 +436,15 @@ mod tests {
     #[tokio::test]
     async fn test_gossip_loop_starts_in_idle_mode() {
         use crate::gossip::round::IDLE_TIMEOUT_SEC;
-        let mut scheduler = GossipScheduler::new();
+        let (mut scheduler, strike_tracker, state, peer_list, transport_manager) =
+            make_loop_args();
         scheduler.last_active_msg_time =
             std::time::Instant::now() - Duration::from_secs(IDLE_TIMEOUT_SEC + 5);
         assert!(scheduler.is_idle());
-        let strike_tracker = StrikeTracker::new();
-        let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
-        let transport_manager = Arc::new(Mutex::new(
-            crate::transport::unified::TransportManager::new(
-                crate::transport::unified::TransportPreference::BleOnly,
-            ),
-        ));
         let handle = tokio::spawn(run_gossip_loop(
             scheduler,
             strike_tracker,
+            state,
             peer_list,
             transport_manager,
         ));
