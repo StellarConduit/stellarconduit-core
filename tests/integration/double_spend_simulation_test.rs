@@ -16,9 +16,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use stellarconduit_core::message::types::TransactionEnvelope;
-use stellarconduit_core::relay::{RelayNode, StellarRpcClient};
+use stellarconduit_core::relay::{RelayNode, RpcError, StellarRpcClient};
 
 /// Mock RPC client that tracks submission count
 struct MockRpcClient {
@@ -29,25 +30,27 @@ struct MockRpcClient {
 unsafe impl Send for MockRpcClient {}
 unsafe impl Sync for MockRpcClient {}
 
+#[async_trait]
 impl StellarRpcClient for MockRpcClient {
-    fn submit_transaction(&self, _tx_xdr: &str) -> Result<String, String> {
+    async fn submit_transaction(&self, _tx_xdr: &str) -> Result<String, RpcError> {
         let count = self.submission_count.fetch_add(1, Ordering::SeqCst);
         Ok(hex::encode([(count + 1) as u8; 32]))
     }
-
-    fn current_ledger_sequence(&self) -> Result<u64, String> {
+    async fn get_account_sequence(&self, _: &str) -> Result<u64, RpcError> {
+        Ok(0)
+    }
+    async fn get_ledger_sequence(&self) -> Result<u64, RpcError> {
         Ok(1234)
     }
-
-    fn current_ledger_hash(&self) -> Result<String, String> {
-        Ok(hex::encode([0xCD; 32]))
+    async fn get_ledger_hash(&self) -> Result<String, RpcError> {
+        Ok(hex::encode([0xCDu8; 32]))
     }
 }
 
 /// Test node that simulates a mesh node
 struct TestNode {
     _node_id: u8,
-    relay_node: Option<Arc<std::sync::Mutex<RelayNode>>>,
+    relay_node: Option<Arc<tokio::sync::Mutex<RelayNode>>>,
     rpc_submission_count: Option<Arc<AtomicUsize>>,
 }
 
@@ -67,7 +70,7 @@ impl TestNode {
         let signing_key = SigningKey::from_bytes(&[node_id; 32]);
         let relay = RelayNode::new(1000, rpc_client, signing_key);
         #[allow(clippy::arc_with_non_send_sync)]
-        let relay_arc = Arc::new(std::sync::Mutex::new(relay));
+        let relay_arc = Arc::new(tokio::sync::Mutex::new(relay));
 
         Self {
             _node_id: node_id,
@@ -78,10 +81,13 @@ impl TestNode {
 
     /// Simulate injecting a message into this node
     async fn inject_message(&self, envelope: TransactionEnvelope) -> Result<(), String> {
-        // If this is a relay node, process the envelope
         if let Some(relay) = &self.relay_node {
-            let mut relay_guard = relay.lock().unwrap();
-            relay_guard.process_envelope(&envelope)?;
+            relay
+                .lock()
+                .await
+                .process_envelope(&envelope)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         Ok(())
     }

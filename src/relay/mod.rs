@@ -65,12 +65,11 @@ impl RelayNode {
         }
 
         let tx_hash = self.rpc_client.submit_transaction(&envelope.tx_xdr).await?;
-        let tx_id = decode_hash_32(&tx_hash, "transaction hash")
-            .map_err(|e| RpcError::Network(e))?;
+        let tx_id = decode_hash_32(&tx_hash, "transaction hash").map_err(RpcError::Network)?;
         let sequence = self.rpc_client.get_ledger_sequence().await?;
         let chain_hash_str = self.rpc_client.get_ledger_hash().await?;
-        let chain_hash = decode_hash_32(&chain_hash_str, "ledger hash")
-            .map_err(|e| RpcError::Network(e))?;
+        let chain_hash =
+            decode_hash_32(&chain_hash_str, "ledger hash").map_err(RpcError::Network)?;
 
         let proof = RelayChainProof::sign(&self.signing_key, &tx_id, &chain_hash, sequence);
         self.deduplicator
@@ -83,9 +82,9 @@ impl RelayNode {
 fn decode_hash_32(hash: &str, label: &str) -> Result<[u8; 32], String> {
     let normalized = hash.strip_prefix("0x").unwrap_or(hash);
     let bytes = hex::decode(normalized).map_err(|e| format!("invalid {label}: {e}"))?;
-    bytes
-        .try_into()
-        .map_err(|bytes: Vec<u8>| format!("invalid {label}: expected 32 bytes, got {}", bytes.len()))
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        format!("invalid {label}: expected 32 bytes, got {}", bytes.len())
+    })
 }
 
 #[cfg(test)]
@@ -108,9 +107,15 @@ mod tests {
             self.submit_count.fetch_add(1, Ordering::SeqCst);
             Ok(self.tx_hash.clone())
         }
-        async fn get_account_sequence(&self, _: &str) -> Result<u64, RpcError> { Ok(0) }
-        async fn get_ledger_sequence(&self) -> Result<u64, RpcError> { Ok(self.ledger_sequence) }
-        async fn get_ledger_hash(&self) -> Result<String, RpcError> { Ok(self.ledger_hash.clone()) }
+        async fn get_account_sequence(&self, _: &str) -> Result<u64, RpcError> {
+            Ok(0)
+        }
+        async fn get_ledger_sequence(&self) -> Result<u64, RpcError> {
+            Ok(self.ledger_sequence)
+        }
+        async fn get_ledger_hash(&self) -> Result<String, RpcError> {
+            Ok(self.ledger_hash.clone())
+        }
     }
 
     fn make_client(submit_count: Arc<AtomicUsize>) -> MockRpcClient {
@@ -142,7 +147,11 @@ mod tests {
         let submit_count = Arc::new(AtomicUsize::new(0));
         let signing_key = create_signing_key();
         let verifying_key = signing_key.verifying_key();
-        let mut relay = RelayNode::new(1000, Box::new(make_client(submit_count.clone())), signing_key);
+        let mut relay = RelayNode::new(
+            1000,
+            Box::new(make_client(submit_count.clone())),
+            signing_key,
+        );
         let envelope = create_test_envelope([1u8; 32]);
 
         let proof1 = relay.process_envelope(&envelope).await.unwrap();
@@ -157,7 +166,11 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_identical_envelopes_within_window() {
         let submit_count = Arc::new(AtomicUsize::new(0));
-        let mut relay = RelayNode::new(1000, Box::new(make_client(submit_count.clone())), create_signing_key());
+        let mut relay = RelayNode::new(
+            1000,
+            Box::new(make_client(submit_count.clone())),
+            create_signing_key(),
+        );
         let envelope = create_test_envelope([1u8; 32]);
 
         let p1 = relay.process_envelope(&envelope).await.unwrap();
@@ -172,10 +185,20 @@ mod tests {
     #[tokio::test]
     async fn test_different_envelopes_submit_separately() {
         let submit_count = Arc::new(AtomicUsize::new(0));
-        let mut relay = RelayNode::new(1000, Box::new(make_client(submit_count.clone())), create_signing_key());
+        let mut relay = RelayNode::new(
+            1000,
+            Box::new(make_client(submit_count.clone())),
+            create_signing_key(),
+        );
 
-        relay.process_envelope(&create_test_envelope([1u8; 32])).await.unwrap();
-        relay.process_envelope(&create_test_envelope([2u8; 32])).await.unwrap();
+        relay
+            .process_envelope(&create_test_envelope([1u8; 32]))
+            .await
+            .unwrap();
+        relay
+            .process_envelope(&create_test_envelope([2u8; 32]))
+            .await
+            .unwrap();
 
         assert_eq!(submit_count.load(Ordering::SeqCst), 2);
     }

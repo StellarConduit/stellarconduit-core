@@ -30,9 +30,6 @@ async-trait = "0.1"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
-# HTTP client for Stellar Horizon API
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-
 # Persistence
 rusqlite = { version = "0.31", features = ["bundled"] }
 tokio-rusqlite = "0.5"

@@ -46,9 +46,15 @@ impl StellarRpcClient for MockRpcClient {
             Ok(self.tx_hash.clone())
         }
     }
-    async fn get_account_sequence(&self, _: &str) -> Result<u64, RpcError> { Ok(0) }
-    async fn get_ledger_sequence(&self) -> Result<u64, RpcError> { Ok(self.ledger_sequence) }
-    async fn get_ledger_hash(&self) -> Result<String, RpcError> { Ok(self.ledger_hash.clone()) }
+    async fn get_account_sequence(&self, _: &str) -> Result<u64, RpcError> {
+        Ok(0)
+    }
+    async fn get_ledger_sequence(&self) -> Result<u64, RpcError> {
+        Ok(self.ledger_sequence)
+    }
+    async fn get_ledger_hash(&self) -> Result<String, RpcError> {
+        Ok(self.ledger_hash.clone())
+    }
 }
 
 fn create_envelope(origin: [u8; 32]) -> TransactionEnvelope {
@@ -71,7 +77,11 @@ async fn test_process_envelope_success() {
     let tx_id = [0xABu8; 32];
     let signing_key = relay_signing_key();
     let verifying_key = signing_key.verifying_key();
-    let mut relay = RelayNode::new(1000, Box::new(MockRpcClient::new(&hex::encode(tx_id))), signing_key);
+    let mut relay = RelayNode::new(
+        1000,
+        Box::new(MockRpcClient::new(&hex::encode(tx_id))),
+        signing_key,
+    );
 
     let result = relay.process_envelope(&create_envelope([2u8; 32])).await;
 
@@ -84,7 +94,11 @@ async fn test_process_envelope_success() {
 
 #[tokio::test]
 async fn test_process_envelope_rpc_failure() {
-    let mut relay = RelayNode::new(1000, Box::new(MockRpcClient::failing()), relay_signing_key());
+    let mut relay = RelayNode::new(
+        1000,
+        Box::new(MockRpcClient::failing()),
+        relay_signing_key(),
+    );
     let result = relay.process_envelope(&create_envelope([2u8; 32])).await;
     assert!(result.is_err());
 }
@@ -94,7 +108,11 @@ async fn test_process_envelope_deduplicates() {
     let tx_id = [0xABu8; 32];
     let signing_key = relay_signing_key();
     let verifying_key = signing_key.verifying_key();
-    let mut relay = RelayNode::new(1000, Box::new(MockRpcClient::new(&hex::encode(tx_id))), signing_key);
+    let mut relay = RelayNode::new(
+        1000,
+        Box::new(MockRpcClient::new(&hex::encode(tx_id))),
+        signing_key,
+    );
     let envelope = create_envelope([2u8; 32]);
 
     let proof1 = relay.process_envelope(&envelope).await.unwrap();

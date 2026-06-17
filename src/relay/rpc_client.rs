@@ -52,10 +52,7 @@ impl HorizonRpcClient {
                 Err(e) => {
                     last_err = e;
                     if attempt + 1 < max_attempts {
-                        let delay = backoff_ms
-                            .get(attempt as usize)
-                            .copied()
-                            .unwrap_or(4000);
+                        let delay = backoff_ms.get(attempt as usize).copied().unwrap_or(4000);
                         tokio::time::sleep(Duration::from_millis(delay)).await;
                     }
                 }
@@ -119,7 +116,10 @@ impl StellarRpcClient for HorizonRpcClient {
 
         let status = response.status();
         if status.is_success() {
-            let body: HorizonSuccess = response.json().await.map_err(|e| RpcError::Network(e.to_string()))?;
+            let body: HorizonSuccess = response
+                .json()
+                .await
+                .map_err(|e| RpcError::Network(e.to_string()))?;
             Ok(body.hash)
         } else {
             let body_text = response.text().await.unwrap_or_default();
@@ -171,7 +171,10 @@ impl StellarRpcClient for HorizonRpcClient {
             return Err(RpcError::Http { status, body });
         }
 
-        let account: AccountResponse = response.json().await.map_err(|e| RpcError::Network(e.to_string()))?;
+        let account: AccountResponse = response
+            .json()
+            .await
+            .map_err(|e| RpcError::Network(e.to_string()))?;
         account
             .sequence
             .parse::<u64>()
@@ -205,12 +208,54 @@ impl StellarRpcClient for HorizonRpcClient {
             return Err(RpcError::Http { status, body });
         }
 
-        let data: LedgersResponse = response.json().await.map_err(|e| RpcError::Network(e.to_string()))?;
+        let data: LedgersResponse = response
+            .json()
+            .await
+            .map_err(|e| RpcError::Network(e.to_string()))?;
         data._embedded
             .records
             .into_iter()
             .next()
             .map(|r| r.sequence)
+            .ok_or_else(|| RpcError::Network("no ledger records returned".into()))
+    }
+
+    async fn get_ledger_hash(&self) -> Result<String, RpcError> {
+        #[derive(Deserialize)]
+        struct LedgerRecord {
+            hash: String,
+        }
+        #[derive(Deserialize)]
+        struct EmbeddedRecords {
+            records: Vec<LedgerRecord>,
+        }
+        #[derive(Deserialize)]
+        struct LedgersResponse {
+            _embedded: EmbeddedRecords,
+        }
+
+        let response = self
+            .client
+            .get(format!("{}/ledgers?order=desc&limit=1", self.base_url))
+            .send()
+            .await
+            .map_err(|e| RpcError::Network(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(RpcError::Http { status, body });
+        }
+
+        let data: LedgersResponse = response
+            .json()
+            .await
+            .map_err(|e| RpcError::Network(e.to_string()))?;
+        data._embedded
+            .records
+            .into_iter()
+            .next()
+            .map(|r| r.hash)
             .ok_or_else(|| RpcError::Network("no ledger records returned".into()))
     }
 }
@@ -237,8 +282,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/transactions"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "hash": "abc123" })),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "hash": "abc123" })),
             )
             .mount(&server)
             .await;
@@ -255,18 +299,16 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/transactions"))
-            .respond_with(
-                ResponseTemplate::new(400).set_body_json(serde_json::json!({
-                    "type": "https://stellar.org/horizon-errors/transaction_failed",
-                    "title": "Transaction Failed",
-                    "detail": "The transaction failed when tried to be applied on the ledger",
-                    "extras": {
-                        "result_codes": {
-                            "transaction": "tx_bad_auth"
-                        }
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "type": "https://stellar.org/horizon-errors/transaction_failed",
+                "title": "Transaction Failed",
+                "detail": "The transaction failed when tried to be applied on the ledger",
+                "extras": {
+                    "result_codes": {
+                        "transaction": "tx_bad_auth"
                     }
-                })),
-            )
+                }
+            })))
             .mount(&server)
             .await;
 
@@ -299,12 +341,21 @@ mod tests {
                     Ok("ok_hash".into())
                 }
             }
-            async fn get_account_sequence(&self, _: &str) -> Result<u64, RpcError> { Ok(0) }
-            async fn get_ledger_sequence(&self) -> Result<u64, RpcError> { Ok(0) }
+            async fn get_account_sequence(&self, _: &str) -> Result<u64, RpcError> {
+                Ok(0)
+            }
+            async fn get_ledger_sequence(&self) -> Result<u64, RpcError> {
+                Ok(0)
+            }
+            async fn get_ledger_hash(&self) -> Result<String, RpcError> {
+                Ok(String::new())
+            }
         }
 
         let calls = Arc::new(AtomicUsize::new(0));
-        let mock = CountingMock { calls: calls.clone() };
+        let mock = CountingMock {
+            calls: calls.clone(),
+        };
 
         // Build a HorizonRpcClient just for its submit_with_retry driver,
         // but we want to test the retry logic generically; inline the retry loop
@@ -315,12 +366,19 @@ mod tests {
         let mut result = Err(RpcError::Network("".into()));
         for attempt in 0..max_attempts {
             match mock.submit_transaction("xdr").await {
-                Ok(h) => { result = Ok(h); break; }
-                Err(e @ RpcError::TransactionRejected { .. }) => { result = Err(e); break; }
+                Ok(h) => {
+                    result = Ok(h);
+                    break;
+                }
+                Err(e @ RpcError::TransactionRejected { .. }) => {
+                    result = Err(e);
+                    break;
+                }
                 Err(e) => {
                     last_err = e;
                     if attempt + 1 < max_attempts {
-                        tokio::time::sleep(Duration::from_millis(backoff_ms[attempt as usize])).await;
+                        tokio::time::sleep(Duration::from_millis(backoff_ms[attempt as usize]))
+                            .await;
                     }
                 }
             }
@@ -347,19 +405,31 @@ mod tests {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Err(RpcError::Network("always fails".into()))
             }
-            async fn get_account_sequence(&self, _: &str) -> Result<u64, RpcError> { Ok(0) }
-            async fn get_ledger_sequence(&self) -> Result<u64, RpcError> { Ok(0) }
+            async fn get_account_sequence(&self, _: &str) -> Result<u64, RpcError> {
+                Ok(0)
+            }
+            async fn get_ledger_sequence(&self) -> Result<u64, RpcError> {
+                Ok(0)
+            }
+            async fn get_ledger_hash(&self) -> Result<String, RpcError> {
+                Ok(String::new())
+            }
         }
 
         let calls = Arc::new(AtomicUsize::new(0));
-        let mock = AlwaysFails { calls: calls.clone() };
+        let mock = AlwaysFails {
+            calls: calls.clone(),
+        };
 
         let max_attempts: u8 = 3;
         let mut last_err: RpcError = RpcError::Network("".into());
         for attempt in 0..max_attempts {
             match mock.submit_transaction("xdr").await {
                 Ok(_) => panic!("should not succeed"),
-                Err(e @ RpcError::TransactionRejected { .. }) => { last_err = e; break; }
+                Err(e @ RpcError::TransactionRejected { .. }) => {
+                    last_err = e;
+                    break;
+                }
                 Err(e) => {
                     last_err = e;
                     if attempt + 1 < max_attempts {
