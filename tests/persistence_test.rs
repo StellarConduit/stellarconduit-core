@@ -160,3 +160,33 @@ async fn test_get_relay_proof_missing_returns_none() {
 
     assert_eq!(missing, None);
 }
+
+#[tokio::test]
+async fn test_database_close_checkpoints_wal() {
+    use std::path::PathBuf;
+    // Use a temp file so we can reopen it after close().
+    let db_path = std::env::temp_dir().join("stellarconduit_wal_test.db");
+    let db_path_str = db_path.to_str().unwrap().to_string();
+
+    // Clean up from any previous run.
+    let _ = std::fs::remove_file(&db_path);
+    let wal_path = PathBuf::from(format!("{}-wal", &db_path_str));
+    let _ = std::fs::remove_file(&wal_path);
+
+    {
+        let db = MeshDatabase::init(&db_path_str).await.unwrap();
+        let env = create_mock_envelope(0xFA);
+        db.save_envelope(&env).await.unwrap();
+        db.close().await.expect("close() should succeed");
+    }
+
+    // Reopen and assert data survived the WAL checkpoint.
+    let db2 = MeshDatabase::init(&db_path_str).await.unwrap();
+    let envelopes = db2.load_pending_envelopes().await.unwrap();
+    assert_eq!(envelopes.len(), 1, "data must persist after WAL checkpoint");
+    assert_eq!(envelopes[0].message_id, [0xFA; 32]);
+
+    // Cleanup.
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(&wal_path);
+}

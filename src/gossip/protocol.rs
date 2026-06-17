@@ -17,6 +17,7 @@ use crate::message::types::{ProtocolMessage, SyncRequest, SyncResponse, Transact
 use crate::peer::identity::PeerIdentity;
 use crate::topology::events::TopologyEventBus;
 use crate::transport::unified::TransportManager;
+use tokio_util::sync::CancellationToken;
 
 /// Threshold above which a SyncResponse is treated as a "macro-merge" event.
 const MACRO_MERGE_THRESHOLD: usize = 500;
@@ -258,6 +259,7 @@ pub async fn run_gossip_loop(
     peer_list: Arc<Mutex<PeerList>>,
     transport_manager: Arc<Mutex<TransportManager>>,
     event_bus: Option<TopologyEventBus>,
+    shutdown: CancellationToken,
 ) {
     let fanout_calc = FanoutCalculator::new();
     let mut bloom = SlidingBloomFilter::new(10_000, 0.01);
@@ -270,6 +272,11 @@ pub async fn run_gossip_loop(
 
     loop {
         tokio::select! {
+            _ = shutdown.cancelled() => {
+                log::info!("Gossip loop: received shutdown signal");
+                break;
+            }
+
             _ = sleep(Duration::from_millis(
                 if scheduler.is_idle() {
                     IDLE_ROUND_INTERVAL_MS
@@ -328,6 +335,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
 
     fn mock_envelope(id_byte: u8) -> TransactionEnvelope {
         TransactionEnvelope {
@@ -412,6 +420,7 @@ mod tests {
             peer_list,
             transport_manager,
             None,
+            CancellationToken::new(),
         ));
         let result = timeout(Duration::from_millis(200), async {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -435,6 +444,7 @@ mod tests {
             peer_list,
             transport_manager,
             None,
+            CancellationToken::new(),
         ));
         tokio::time::sleep(Duration::from_millis(50)).await;
         handle.abort();
@@ -459,6 +469,7 @@ mod tests {
             peer_list,
             transport_manager,
             None,
+            CancellationToken::new(),
         ));
         let result = timeout(Duration::from_millis(150), async {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -469,6 +480,29 @@ mod tests {
     }
 
     // ── Acceptance criteria tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_gossip_loop_exits_on_cancellation() {
+        let scheduler = GossipScheduler::new();
+        let strike_tracker = StrikeTracker::new();
+        let state = Arc::new(Mutex::new(GossipState::new()));
+        let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
+        let transport_manager = make_transport();
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(run_gossip_loop(
+            scheduler,
+            strike_tracker,
+            state,
+            peer_list,
+            transport_manager,
+            None,
+            token.clone(),
+        ));
+        token.cancel();
+        let result = timeout(Duration::from_millis(500), handle).await;
+        assert!(result.is_ok(), "gossip loop did not exit within 500ms after cancellation");
+        assert!(result.unwrap().is_ok(), "gossip loop task panicked");
+    }
 
     #[test]
     fn test_fanout_skips_banned_peers() {

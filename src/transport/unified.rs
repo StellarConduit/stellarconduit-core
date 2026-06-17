@@ -221,6 +221,11 @@ impl TransportManager {
         self.active_connections.len()
     }
 
+    /// Returns the pubkeys of all currently connected peers.
+    pub fn connected_peers(&self) -> Vec<[u8; 32]> {
+        self.active_connections.keys().copied().collect()
+    }
+
     pub fn pending_message_count(&self) -> usize {
         self.pending_messages.len()
     }
@@ -380,12 +385,18 @@ impl TransportManager {
         }
     }
 
-    /// Disconnect all active connections and clear the map.
-    pub async fn shutdown(&mut self) {
+    /// Disconnect all active connections and clear pending messages.
+    pub async fn disconnect_all(&mut self) {
         for (_, mut conn) in self.active_connections.drain() {
             let _ = conn.disconnect().await;
         }
         self.pending_messages.clear();
+        log::info!("TransportManager: all connections closed");
+    }
+
+    /// Alias for [`disconnect_all`] kept for backwards compatibility.
+    pub async fn shutdown(&mut self) {
+        self.disconnect_all().await;
     }
 
     pub async fn power_tick(&mut self) -> Result<PowerTickOutcome, TransportError> {
@@ -637,6 +648,26 @@ mod tests {
         async fn disconnect(&mut self) -> Result<(), TransportError> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_all_clears_connections() {
+        let mut mgr = TransportManager::new(TransportPreference::BleOnly);
+        // Add 3 mock connections directly into the active map.
+        for b in [0x10u8, 0x11, 0x12] {
+            let p = peer(b);
+            let recv_calls = Arc::new(AtomicUsize::new(0));
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let inbox = Arc::new(Mutex::new(Vec::new()));
+            mgr.active_connections.insert(
+                p.pubkey,
+                Box::new(MockConnection::new(p, recv_calls, sent, inbox)),
+            );
+        }
+        assert_eq!(mgr.connection_count(), 3);
+        mgr.disconnect_all().await;
+        assert_eq!(mgr.connection_count(), 0);
+        assert_eq!(mgr.pending_message_count(), 0);
     }
 
     #[tokio::test]
