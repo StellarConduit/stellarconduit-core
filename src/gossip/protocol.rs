@@ -204,11 +204,12 @@ pub async fn run_gossip_loop(
     mut scheduler: GossipScheduler,
     mut strike_tracker: StrikeTracker,
     peer_list: Arc<Mutex<PeerList>>,
-    _transport_manager: Arc<Mutex<TransportManager>>,
+    transport_manager: Arc<Mutex<TransportManager>>,
     event_bus: Option<TopologyEventBus>,
+    state: Arc<Mutex<GossipState>>,
 ) {
-    let mut _anti_entropy_timer = tokio::time::interval(Duration::from_secs(30));
-    let mut ban_check_timer = tokio::time::interval(Duration::from_secs(60)); // Check ban expiration every minute
+    let mut anti_entropy_timer = tokio::time::interval(Duration::from_secs(30));
+    let mut ban_check_timer = tokio::time::interval(Duration::from_secs(60));
 
     // Subscribe to topology events if an event bus is provided.
     let mut topology_events = event_bus.as_ref().map(|bus| bus.subscribe());
@@ -230,10 +231,67 @@ pub async fn run_gossip_loop(
                 }
             }
 
-            // Anti-entropy pull interval (every 30 seconds)
-            _ = _anti_entropy_timer.tick() => {
+            // Anti-entropy pull: every 30 s, pick one random active peer,
+            // send it a SyncRequest, and merge its SyncResponse into our state.
+            _ = anti_entropy_timer.tick() => {
                 log::debug!("Anti-entropy sync timer fired");
-                // TODO: Pick one random active peer and send state.generate_sync_request()
+
+                // Pick one random non-banned active peer.
+                let peer_identity = {
+                    let pl = peer_list.lock().await;
+                    let active: Vec<_> = pl
+                        .get_active_peers()
+                        .into_iter()
+                        .filter(|p| !p.is_banned)
+                        .collect();
+                    if active.is_empty() {
+                        None
+                    } else {
+                        use rand::seq::SliceRandom;
+                        active.choose(&mut rand::thread_rng()).map(|p| p.identity.clone())
+                    }
+                };
+
+                if let Some(peer) = peer_identity {
+                    // Build the sync request from current state.
+                    let sync_req = {
+                        let st = state.lock().await;
+                        st.generate_sync_request()
+                    };
+
+                    let msg = crate::message::types::ProtocolMessage::SyncRequest(sync_req);
+
+                    // Send the SyncRequest to the chosen peer.
+                    let send_result = {
+                        let mut tm = transport_manager.lock().await;
+                        tm.send_to(&peer, msg).await
+                    };
+
+                    match send_result {
+                        Ok(()) => {
+                            log::debug!("Anti-entropy SyncRequest sent to {}", peer);
+                            // Wait for a SyncResponse from the same peer (best-effort).
+                            let response = {
+                                let mut tm = transport_manager.lock().await;
+                                tm.recv_any().await
+                            };
+                            if let Some((from_peer, crate::message::types::ProtocolMessage::SyncResponse(resp))) = response {
+                                if from_peer == peer {
+                                    log::debug!(
+                                        "Anti-entropy SyncResponse from {}: {} envelope(s)",
+                                        peer,
+                                        resp.missing_envelopes.len()
+                                    );
+                                    let mut st = state.lock().await;
+                                    st.handle_sync_response(resp);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Anti-entropy SyncRequest to {} failed: {:?}", peer, e);
+                        }
+                    }
+                }
             }
 
             // Check ban expiration periodically
@@ -242,7 +300,6 @@ pub async fn run_gossip_loop(
                 let unbanned = peer_list_guard.check_ban_expirations();
                 if !unbanned.is_empty() {
                     log::info!("Unbanned {} peer(s) after expiration", unbanned.len());
-                    // Clear strike tracker for unbanned peers
                     for peer in unbanned {
                         strike_tracker.clear_peer(&peer);
                     }
@@ -348,12 +405,14 @@ mod tests {
                 crate::transport::unified::TransportPreference::BleOnly,
             ),
         ));
+        let state = Arc::new(Mutex::new(GossipState::new()));
         let handle = tokio::spawn(run_gossip_loop(
             scheduler,
             strike_tracker,
             peer_list,
             transport_manager,
             None,
+            state,
         ));
         let result = timeout(Duration::from_millis(200), async {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -373,12 +432,14 @@ mod tests {
                 crate::transport::unified::TransportPreference::BleOnly,
             ),
         ));
+        let state = Arc::new(Mutex::new(GossipState::new()));
         let handle = tokio::spawn(run_gossip_loop(
             scheduler,
             strike_tracker,
             peer_list,
             transport_manager,
             None,
+            state,
         ));
         tokio::time::sleep(Duration::from_millis(50)).await;
         handle.abort();
@@ -399,12 +460,14 @@ mod tests {
                 crate::transport::unified::TransportPreference::BleOnly,
             ),
         ));
+        let state = Arc::new(Mutex::new(GossipState::new()));
         let handle = tokio::spawn(run_gossip_loop(
             scheduler,
             strike_tracker,
             peer_list,
             transport_manager,
             None,
+            state,
         ));
         let result = timeout(Duration::from_millis(150), async {
             tokio::time::sleep(Duration::from_millis(50)).await;
