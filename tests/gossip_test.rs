@@ -140,3 +140,167 @@ fn test_select_random_peers_unique() {
         "Selected peers must be strictly unique"
     );
 }
+
+// ==========================================
+// Anti-Entropy Pull Protocol Tests
+// ==========================================
+
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+use stellarconduit_core::discovery::peer_list::PeerList;
+use stellarconduit_core::gossip::protocol::{run_gossip_loop, GossipState};
+use stellarconduit_core::gossip::round::GossipScheduler as GossipSched;
+use stellarconduit_core::gossip::strike_tracker::StrikeTracker;
+use stellarconduit_core::message::types::{SyncRequest, SyncResponse, TransactionEnvelope};
+use stellarconduit_core::transport::unified::{TransportManager, TransportPreference};
+
+fn make_envelope(id: u8) -> TransactionEnvelope {
+    TransactionEnvelope {
+        message_id: [id; 32],
+        origin_pubkey: [0u8; 32],
+        tx_xdr: format!("XDR{}", id),
+        ttl_hops: 10,
+        timestamp: id as u64,
+        signature: [0u8; 64],
+    }
+}
+
+/// GossipState::generate_sync_request returns a prefix for every buffered envelope.
+#[test]
+fn test_anti_entropy_sync_request_contains_all_known_ids() {
+    let mut state = GossipState::new();
+    state.add_envelope(make_envelope(0x01));
+    state.add_envelope(make_envelope(0x02));
+    state.add_envelope(make_envelope(0x03));
+
+    let req = state.generate_sync_request();
+    assert_eq!(req.known_message_ids.len(), 3);
+
+    for (i, prefix) in req.known_message_ids.iter().enumerate() {
+        let expected_byte = (i + 1) as u8;
+        assert_eq!(*prefix, [expected_byte; 4]);
+    }
+}
+
+/// Node B asks node A what it's missing; A correctly identifies the delta.
+#[test]
+fn test_anti_entropy_pull_delta_only_missing_envelopes() {
+    let mut node_a = GossipState::new();
+    node_a.add_envelope(make_envelope(0xAA));
+    node_a.add_envelope(make_envelope(0xBB));
+    node_a.add_envelope(make_envelope(0xCC));
+
+    let mut node_b = GossipState::new();
+    node_b.add_envelope(make_envelope(0xAA));
+
+    let req: SyncRequest = node_b.generate_sync_request();
+    let resp: SyncResponse = node_a.handle_sync_request(&req);
+
+    // A should send B the two envelopes it doesn't have.
+    assert_eq!(resp.missing_envelopes.len(), 2);
+    let ids: Vec<u8> = resp
+        .missing_envelopes
+        .iter()
+        .map(|e| e.message_id[0])
+        .collect();
+    assert!(ids.contains(&0xBB));
+    assert!(ids.contains(&0xCC));
+}
+
+/// After a pull, the receiver's queue grows by the right amount.
+#[test]
+fn test_anti_entropy_handle_sync_response_merges_into_queue() {
+    let mut state = GossipState::new();
+    state.add_envelope(make_envelope(0x10));
+
+    let resp = SyncResponse {
+        missing_envelopes: vec![make_envelope(0x20), make_envelope(0x30)],
+    };
+    state.handle_sync_response(resp);
+
+    assert_eq!(state.active_queue.len(), 3);
+}
+
+/// Duplicate envelopes in a SyncResponse are all accepted (dedup is bloom-filter's job).
+#[test]
+fn test_anti_entropy_sync_response_empty_no_panic() {
+    let mut state = GossipState::new();
+    let resp = SyncResponse {
+        missing_envelopes: vec![],
+    };
+    state.handle_sync_response(resp);
+    assert_eq!(state.active_queue.len(), 0);
+}
+
+/// When there are no active peers the gossip loop does not panic or stall.
+#[tokio::test]
+async fn test_anti_entropy_loop_no_peers_does_not_stall() {
+    use tokio::time::timeout;
+
+    let scheduler = GossipSched::new();
+    let strike_tracker = StrikeTracker::new();
+    let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
+    let transport_manager = Arc::new(Mutex::new(TransportManager::new(
+        TransportPreference::BleOnly,
+    )));
+    let state = Arc::new(Mutex::new(GossipState::new()));
+
+    let handle = tokio::spawn(run_gossip_loop(
+        scheduler,
+        strike_tracker,
+        peer_list,
+        transport_manager,
+        None,
+        state,
+    ));
+
+    let result = timeout(Duration::from_millis(200), async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    })
+    .await;
+    assert!(result.is_ok(), "gossip loop stalled with no peers");
+    handle.abort();
+}
+
+/// The macro-merge backlog path activates for large SyncResponse payloads.
+#[test]
+fn test_anti_entropy_macro_merge_uses_backlog() {
+    use stellarconduit_core::gossip::protocol::MACRO_MERGE_BATCH_SIZE;
+
+    let mut state = GossipState::new();
+
+    // Build a response that exceeds the macro-merge threshold (500).
+    let large_resp = SyncResponse {
+        missing_envelopes: (0u16..501)
+            .map(|i| TransactionEnvelope {
+                message_id: {
+                    let mut id = [0u8; 32];
+                    id[0] = (i >> 8) as u8;
+                    id[1] = (i & 0xFF) as u8;
+                    id
+                },
+                origin_pubkey: [0u8; 32],
+                tx_xdr: format!("XDR{}", i),
+                ttl_hops: 10,
+                timestamp: i as u64,
+                signature: [0u8; 64],
+            })
+            .collect(),
+    };
+
+    state.handle_sync_response(large_resp);
+
+    // Nothing should be in the active queue yet — all in the backlog.
+    assert_eq!(state.active_queue.len(), 0);
+    assert_eq!(state.pending_macro_merge_len(), 501);
+
+    // Process one batch.
+    let moved = state.process_paced_recovery_batch(MACRO_MERGE_BATCH_SIZE);
+    assert_eq!(moved, MACRO_MERGE_BATCH_SIZE);
+    assert_eq!(state.active_queue.len(), MACRO_MERGE_BATCH_SIZE);
+    assert_eq!(
+        state.pending_macro_merge_len(),
+        501 - MACRO_MERGE_BATCH_SIZE
+    );
+}
