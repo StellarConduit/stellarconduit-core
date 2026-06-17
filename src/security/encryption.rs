@@ -65,7 +65,7 @@ pub fn ed25519_to_x25519(signing_key: &SigningKey) -> Result<[u8; 32], Encryptio
 
     // Per RFC 7748 and RFC 8032: hash the seed with SHA-512 and use first 32 bytes
     let mut hasher = Sha512::new();
-    hasher.update(&seed);
+    hasher.update(seed);
     let hash = hasher.finalize();
 
     let mut x25519_bytes = [0u8; 32];
@@ -391,10 +391,10 @@ impl<C: Connection + Send + Sync> Connection for EncryptedConnection<C> {
         let ciphertext = self
             .encrypt_message(&msg)
             .await
-            .map_err(|e| TransportError::from(e))?;
+            .map_err(TransportError::from)?;
 
         // Frame the ciphertext with length prefix
-        let _framed = frame_noise_message(&ciphertext).map_err(|e| TransportError::from(e))?;
+        let _framed = frame_noise_message(&ciphertext).map_err(TransportError::from)?;
 
         // Send the framed ciphertext wrapped in a dummy ProtocolMessage
         // In practice, we'd have a proper framing mechanism
@@ -416,11 +416,11 @@ impl<C: Connection + Send + Sync> Connection for EncryptedConnection<C> {
         let framed = self.inner.recv().await?;
 
         // Unframe and decrypt
-        let ciphertext = unframe_noise_message(&framed).map_err(|e| TransportError::from(e))?;
+        let ciphertext = unframe_noise_message(&framed).map_err(TransportError::from)?;
 
         self.decrypt_message(&ciphertext)
             .await
-            .map_err(|e| TransportError::from(e))
+            .map_err(TransportError::from)
     }
 
     async fn disconnect(&mut self) -> Result<(), TransportError> {

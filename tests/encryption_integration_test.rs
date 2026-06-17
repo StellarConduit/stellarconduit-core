@@ -4,7 +4,7 @@ use rand::rngs::OsRng;
 use std::sync::Arc;
 use stellarconduit_core::message::types::{ProtocolMessage, TransactionEnvelope};
 use stellarconduit_core::peer::identity::PeerIdentity;
-use stellarconduit_core::security::encryption::{EncryptedConnection, EncryptionError};
+use stellarconduit_core::security::encryption::EncryptionError;
 use stellarconduit_core::transport::connection::{Connection, ConnectionState, TransportType};
 use stellarconduit_core::transport::errors::TransportError;
 use tokio::sync::Mutex;
@@ -18,6 +18,7 @@ struct MockConnection {
     recv_queue: Arc<Mutex<Vec<ProtocolMessage>>>,
 }
 
+#[allow(dead_code)]
 impl MockConnection {
     fn new(remote_peer: PeerIdentity) -> Self {
         Self {
@@ -84,7 +85,7 @@ async fn test_encryption_preserves_message_integrity() {
     let peer1_key = SigningKey::generate(&mut OsRng);
     let peer2_key = SigningKey::generate(&mut OsRng);
 
-    let peer1_id = PeerIdentity::new(peer1_key.verifying_key().to_bytes());
+    let _peer1_id = PeerIdentity::new(peer1_key.verifying_key().to_bytes());
     let _peer2_id = PeerIdentity::new(peer2_key.verifying_key().to_bytes());
 
     // Create a test transaction envelope
@@ -101,7 +102,7 @@ async fn test_encryption_preserves_message_integrity() {
 
     // Serialize and verify size constraints
     let serialized = msg.to_bytes().expect("Serialization failed");
-    assert!(serialized.len() > 0);
+    assert!(!serialized.is_empty());
     assert!(serialized.len() < 65535); // Within Noise max message size
 
     // Deserialize and verify integrity
