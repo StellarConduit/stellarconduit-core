@@ -2,6 +2,7 @@ use std::path::Path;
 use tokio_rusqlite::Connection;
 
 use crate::message::types::{ProtocolMessage, TransactionEnvelope};
+use crate::message::RelayChainProof;
 use crate::peer::peer_node::Peer;
 use crate::persistence::errors::DbError;
 
@@ -43,6 +44,13 @@ impl MeshDatabase {
                     envelope_bytes BLOB,
                     ttl_hops INTEGER,
                     timestamp_sec INTEGER
+                );
+
+                CREATE TABLE IF NOT EXISTS relay_proofs (
+                    tx_id BLOB PRIMARY KEY,
+                    signature BLOB NOT NULL,
+                    chain_hash BLOB NOT NULL,
+                    sequence INTEGER NOT NULL
                 );",
             )?;
             Ok(())
@@ -204,6 +212,78 @@ impl MeshDatabase {
         Ok(count)
     }
 
+    pub async fn save_relay_proof(
+        &self,
+        tx_id: &[u8; 32],
+        proof: &RelayChainProof,
+    ) -> Result<(), DbError> {
+        let sequence = i64::try_from(proof.sequence).map_err(|_| {
+            DbError::InvalidRelayProof("sequence exceeds SQLite INTEGER range".to_string())
+        })?;
+        let tx_id = *tx_id;
+        let signature = proof.signature;
+        let chain_hash = proof.chain_hash;
+
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO relay_proofs (tx_id, signature, chain_hash, sequence)
+                    VALUES (?1, ?2, ?3, ?4)
+                    ON CONFLICT(tx_id) DO UPDATE SET
+                        signature=excluded.signature,
+                        chain_hash=excluded.chain_hash,
+                        sequence=excluded.sequence",
+                    rusqlite::params![&tx_id[..], &signature[..], &chain_hash[..], sequence],
+                )?;
+                Ok(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn get_relay_proof(
+        &self,
+        tx_id: &[u8; 32],
+    ) -> Result<Option<RelayChainProof>, DbError> {
+        let tx_id = *tx_id;
+        let row = self
+            .conn
+            .call(move |conn| {
+                use rusqlite::OptionalExtension;
+
+                Ok(conn
+                    .query_row(
+                        "SELECT signature, chain_hash, sequence FROM relay_proofs WHERE tx_id = ?1",
+                        rusqlite::params![&tx_id[..]],
+                        |row| {
+                            Ok((
+                                row.get::<_, Vec<u8>>(0)?,
+                                row.get::<_, Vec<u8>>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()?)
+            })
+            .await?;
+
+        row.map(|(signature, chain_hash, sequence)| {
+            let signature = vec_to_array::<64>(signature, "signature")?;
+            let chain_hash = vec_to_array::<32>(chain_hash, "chain_hash")?;
+            let sequence = u64::try_from(sequence).map_err(|_| {
+                DbError::InvalidRelayProof("sequence cannot be negative".to_string())
+            })?;
+
+            Ok(RelayChainProof {
+                signature,
+                chain_hash,
+                sequence,
+            })
+        })
+        .transpose()
+    }
+
     pub async fn mark_peer_offline(&self, pubkey: &[u8; 32]) -> Result<usize, DbError> {
         let id_val = *pubkey;
         let count = self
@@ -288,6 +368,12 @@ impl MeshDatabase {
                         envelope_bytes BLOB,
                         ttl_hops INTEGER,
                         timestamp_sec INTEGER
+                    );
+                    CREATE TABLE IF NOT EXISTS relay_proofs (
+                        tx_id BLOB PRIMARY KEY,
+                        signature BLOB NOT NULL,
+                        chain_hash BLOB NOT NULL,
+                        sequence INTEGER NOT NULL
                     );",
                 )?;
                 Ok(Ok::<(), rusqlite::Error>(())?)
@@ -344,4 +430,10 @@ impl MeshDatabase {
             .await
             .unwrap()
     }
+}
+
+fn vec_to_array<const N: usize>(bytes: Vec<u8>, label: &str) -> Result<[u8; N], DbError> {
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        DbError::InvalidRelayProof(format!("{label} must be {N} bytes, got {}", bytes.len()))
+    })
 }

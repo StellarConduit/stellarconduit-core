@@ -3,6 +3,7 @@ use rand::rngs::OsRng;
 use stellarconduit_core::message::{
     signing::{sign_envelope, verify_signature},
     types::{ProtocolMessage, SyncRequest, TopologyUpdate, TransactionEnvelope},
+    RelayChainProof,
 };
 
 fn make_test_envelope(keypair: &SigningKey, tx_xdr: &str) -> TransactionEnvelope {
@@ -102,6 +103,90 @@ fn test_verify_invalid_signature() {
 }
 
 // ─── Serialization Round-Trip Tests ──────────────────────────────────────────
+
+#[test]
+fn test_relay_chain_proof_sign_then_verify_passes() {
+    let mut csprng = OsRng;
+    let signing_key = SigningKey::generate(&mut csprng);
+    let verifying_key = signing_key.verifying_key();
+    let tx_id = [0xAB; 32];
+    let chain_hash = [0xCD; 32];
+    let sequence = 1234;
+
+    let proof = RelayChainProof::sign(&signing_key, &tx_id, &chain_hash, sequence);
+
+    assert_eq!(proof.chain_hash, chain_hash);
+    assert_eq!(proof.sequence, sequence);
+    assert!(proof.verify(&verifying_key, &tx_id));
+}
+
+#[test]
+fn test_relay_chain_proof_rejects_wrong_tx_id() {
+    let mut csprng = OsRng;
+    let signing_key = SigningKey::generate(&mut csprng);
+    let verifying_key = signing_key.verifying_key();
+    let proof = RelayChainProof::sign(&signing_key, &[0xAB; 32], &[0xCD; 32], 1234);
+
+    assert!(!proof.verify(&verifying_key, &[0xEF; 32]));
+}
+
+#[test]
+fn test_relay_chain_proof_rejects_wrong_key() {
+    let mut csprng = OsRng;
+    let signing_key = SigningKey::generate(&mut csprng);
+    let wrong_key = SigningKey::generate(&mut csprng);
+    let proof = RelayChainProof::sign(&signing_key, &[0xAB; 32], &[0xCD; 32], 1234);
+
+    assert!(!proof.verify(&wrong_key.verifying_key(), &[0xAB; 32]));
+}
+
+#[test]
+fn test_relay_chain_proof_rejects_corrupted_signature() {
+    let mut csprng = OsRng;
+    let signing_key = SigningKey::generate(&mut csprng);
+    let verifying_key = signing_key.verifying_key();
+    let mut proof = RelayChainProof::sign(&signing_key, &[0xAB; 32], &[0xCD; 32], 1234);
+
+    proof.signature[0] ^= 0xFF;
+
+    assert!(!proof.verify(&verifying_key, &[0xAB; 32]));
+}
+
+#[test]
+fn test_relay_chain_proof_rejects_corrupted_chain_hash() {
+    let mut csprng = OsRng;
+    let signing_key = SigningKey::generate(&mut csprng);
+    let verifying_key = signing_key.verifying_key();
+    let mut proof = RelayChainProof::sign(&signing_key, &[0xAB; 32], &[0xCD; 32], 1234);
+
+    proof.chain_hash[0] ^= 0xFF;
+
+    assert!(!proof.verify(&verifying_key, &[0xAB; 32]));
+}
+
+#[test]
+fn test_relay_chain_proof_rejects_corrupted_sequence() {
+    let mut csprng = OsRng;
+    let signing_key = SigningKey::generate(&mut csprng);
+    let verifying_key = signing_key.verifying_key();
+    let mut proof = RelayChainProof::sign(&signing_key, &[0xAB; 32], &[0xCD; 32], 1234);
+
+    proof.sequence += 1;
+
+    assert!(!proof.verify(&verifying_key, &[0xAB; 32]));
+}
+
+#[test]
+fn test_relay_chain_proof_msgpack_roundtrip() {
+    let mut csprng = OsRng;
+    let signing_key = SigningKey::generate(&mut csprng);
+    let proof = RelayChainProof::sign(&signing_key, &[0xAB; 32], &[0xCD; 32], 1234);
+
+    let bytes = rmp_serde::to_vec(&proof).expect("proof should serialize");
+    let decoded: RelayChainProof = rmp_serde::from_slice(&bytes).expect("proof should deserialize");
+
+    assert_eq!(decoded, proof);
+}
 
 #[test]
 fn test_transaction_envelope_roundtrip() {

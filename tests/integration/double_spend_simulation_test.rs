@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use ed25519_dalek::SigningKey;
 use stellarconduit_core::message::types::TransactionEnvelope;
 use stellarconduit_core::relay::{RelayNode, StellarRpcClient};
 
@@ -31,7 +32,15 @@ unsafe impl Sync for MockRpcClient {}
 impl StellarRpcClient for MockRpcClient {
     fn submit_transaction(&self, _tx_xdr: &str) -> Result<String, String> {
         let count = self.submission_count.fetch_add(1, Ordering::SeqCst);
-        Ok(format!("tx_hash_{}", count + 1))
+        Ok(hex::encode([(count + 1) as u8; 32]))
+    }
+
+    fn current_ledger_sequence(&self) -> Result<u64, String> {
+        Ok(1234)
+    }
+
+    fn current_ledger_hash(&self) -> Result<String, String> {
+        Ok(hex::encode([0xCD; 32]))
     }
 }
 
@@ -55,7 +64,8 @@ impl TestNode {
         let rpc_client = Box::new(MockRpcClient {
             submission_count: rpc_submission_count.clone(),
         });
-        let relay = RelayNode::new(1000, rpc_client);
+        let signing_key = SigningKey::from_bytes(&[node_id; 32]);
+        let relay = RelayNode::new(1000, rpc_client, signing_key);
         #[allow(clippy::arc_with_non_send_sync)]
         let relay_arc = Arc::new(std::sync::Mutex::new(relay));
 

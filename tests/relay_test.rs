@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use ed25519_dalek::SigningKey;
 use stellarconduit_core::message::signing::verify_signature;
 use stellarconduit_core::message::types::TransactionEnvelope;
 use stellarconduit_core::relay::RelayNode;
@@ -9,6 +10,8 @@ struct MockRpcClient {
     submit_count: AtomicUsize,
     should_fail: bool,
     tx_hash: String,
+    ledger_hash: String,
+    ledger_sequence: u64,
 }
 
 impl MockRpcClient {
@@ -17,6 +20,8 @@ impl MockRpcClient {
             submit_count: AtomicUsize::new(0),
             should_fail: false,
             tx_hash: tx_hash.to_string(),
+            ledger_hash: hex::encode([0xCD; 32]),
+            ledger_sequence: 1234,
         }
     }
 
@@ -25,6 +30,8 @@ impl MockRpcClient {
             submit_count: AtomicUsize::new(0),
             should_fail: true,
             tx_hash: String::new(),
+            ledger_hash: hex::encode([0xCD; 32]),
+            ledger_sequence: 1234,
         }
     }
 }
@@ -37,6 +44,14 @@ impl StellarRpcClient for MockRpcClient {
         } else {
             Ok(self.tx_hash.clone())
         }
+    }
+
+    fn current_ledger_sequence(&self) -> Result<u64, String> {
+        Ok(self.ledger_sequence)
+    }
+
+    fn current_ledger_hash(&self) -> Result<String, String> {
+        Ok(self.ledger_hash.clone())
     }
 }
 
@@ -51,22 +66,32 @@ fn create_envelope(origin: [u8; 32]) -> TransactionEnvelope {
     }
 }
 
+fn relay_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[7u8; 32])
+}
+
 #[test]
 fn test_process_envelope_success() {
-    let rpc_client = Box::new(MockRpcClient::new("test_tx_hash_123"));
-    let mut relay = RelayNode::new(1000, rpc_client);
+    let tx_id = [0xAB; 32];
+    let rpc_client = Box::new(MockRpcClient::new(&hex::encode(tx_id)));
+    let signing_key = relay_signing_key();
+    let verifying_key = signing_key.verifying_key();
+    let mut relay = RelayNode::new(1000, rpc_client, signing_key);
 
     let envelope = create_envelope([2u8; 32]);
     let result = relay.process_envelope(&envelope);
 
     assert!(result.is_ok());
-    assert_eq!(result.unwrap(), "test_tx_hash_123");
+    let proof = result.unwrap();
+    assert_eq!(proof.chain_hash, [0xCD; 32]);
+    assert_eq!(proof.sequence, 1234);
+    assert!(proof.verify(&verifying_key, &tx_id));
 }
 
 #[test]
 fn test_process_envelope_rpc_failure() {
     let rpc_client = Box::new(MockRpcClient::failing());
-    let mut relay = RelayNode::new(1000, rpc_client);
+    let mut relay = RelayNode::new(1000, rpc_client, relay_signing_key());
 
     let envelope = create_envelope([2u8; 32]);
     let result = relay.process_envelope(&envelope);
@@ -76,18 +101,18 @@ fn test_process_envelope_rpc_failure() {
 
 #[test]
 fn test_process_envelope_deduplicates() {
-    let rpc_client = Box::new(MockRpcClient::new("tx_hash"));
-    let mut relay = RelayNode::new(1000, rpc_client);
+    let tx_id = [0xAB; 32];
+    let rpc_client = Box::new(MockRpcClient::new(&hex::encode(tx_id)));
+    let mut relay = RelayNode::new(1000, rpc_client, relay_signing_key());
 
     let envelope = create_envelope([2u8; 32]);
 
     // First call submits
-    let hash1 = relay.process_envelope(&envelope).unwrap();
-    assert_eq!(hash1, "tx_hash");
+    let proof1 = relay.process_envelope(&envelope).unwrap();
 
     // Second call returns cached — RPC not called again
-    let hash2 = relay.process_envelope(&envelope).unwrap();
-    assert_eq!(hash2, hash1);
+    let proof2 = relay.process_envelope(&envelope).unwrap();
+    assert_eq!(proof2, proof1);
 }
 
 #[test]
