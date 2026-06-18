@@ -16,6 +16,7 @@ use crate::gossip::strike_tracker::StrikeTracker;
 use crate::message::signing::verify_signature;
 use crate::message::types::{ProtocolMessage, SyncRequest, SyncResponse, TransactionEnvelope};
 use crate::peer::identity::PeerIdentity;
+use crate::persistence::db::MeshDatabase;
 use crate::topology::events::TopologyEventBus;
 use crate::transport::unified::TransportManager;
 
@@ -124,6 +125,7 @@ pub async fn process_transaction_envelope(
     strike_tracker: &mut StrikeTracker,
     peer_list: Arc<Mutex<PeerList>>,
     transport_manager: Arc<Mutex<TransportManager>>,
+    db: Option<Arc<MeshDatabase>>,
 ) -> Result<(), GossipError> {
     match verify_signature(envelope) {
         Ok(true) => {
@@ -140,12 +142,14 @@ pub async fn process_transaction_envelope(
             let should_ban = strike_tracker.record_failure(&peer_identity);
             if should_ban {
                 const BAN_DURATION_SEC: u64 = 24 * 60 * 60;
-                let mut peer_list_guard = peer_list.lock().await;
-                if peer_list_guard.get_peer(&peer_identity.pubkey).is_none() {
-                    peer_list_guard.insert_or_update(peer_identity.pubkey, 0);
-                }
-                peer_list_guard.ban_peer(&peer_identity.pubkey, BAN_DURATION_SEC);
-                drop(peer_list_guard);
+                crate::security::peer_ban::ban_and_persist(
+                    &peer_list,
+                    db.as_deref(),
+                    &peer_identity.pubkey,
+                    BAN_DURATION_SEC,
+                    "repeated invalid signatures",
+                )
+                .await;
                 let mut transport_guard = transport_manager.lock().await;
                 transport_guard.disconnect_peer(&peer_identity.pubkey).await;
                 drop(transport_guard);
@@ -269,6 +273,7 @@ pub async fn run_gossip_loop(
     peer_list: Arc<Mutex<PeerList>>,
     transport_manager: Arc<Mutex<TransportManager>>,
     event_bus: Option<TopologyEventBus>,
+    db: Option<Arc<MeshDatabase>>,
 ) {
     let fanout_calc = FanoutCalculator::new();
     let mut bloom = SlidingBloomFilter::new(10_000, 0.01);
@@ -369,12 +374,19 @@ pub async fn run_gossip_loop(
             }
 
             _ = ban_check_timer.tick() => {
-                let mut peer_list_guard = peer_list.lock().await;
-                let unbanned = peer_list_guard.check_ban_expirations();
+                let unbanned = {
+                    let mut peer_list_guard = peer_list.lock().await;
+                    peer_list_guard.check_ban_expirations()
+                };
                 if !unbanned.is_empty() {
                     log::info!("Unbanned {} peer(s) after expiration", unbanned.len());
-                    for peer in unbanned {
-                        strike_tracker.clear_peer(&peer);
+                    for peer in &unbanned {
+                        strike_tracker.clear_peer(peer);
+                        if let Some(ref db) = db {
+                            if let Err(e) = db.remove_ban(&peer.pubkey).await {
+                                log::warn!("Failed to remove ban for {} from DB: {:?}", peer, e);
+                            }
+                        }
                     }
                 }
             }
@@ -485,6 +497,7 @@ mod tests {
             peer_list,
             transport_manager,
             None,
+            None,
         ));
         let result = timeout(Duration::from_millis(200), async {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -507,6 +520,7 @@ mod tests {
             state,
             peer_list,
             transport_manager,
+            None,
             None,
         ));
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -531,6 +545,7 @@ mod tests {
             state,
             peer_list,
             transport_manager,
+            None,
             None,
         ));
         let result = timeout(Duration::from_millis(150), async {
@@ -702,6 +717,7 @@ mod tests {
                 &mut strike_tracker,
                 peer_list.clone(),
                 transport_manager.clone(),
+                None,
             )
             .await;
         }
@@ -722,6 +738,7 @@ mod tests {
             &mut strike_tracker,
             peer_list.clone(),
             transport_manager.clone(),
+            None,
         )
         .await;
 
