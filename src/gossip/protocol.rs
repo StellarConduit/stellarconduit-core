@@ -301,9 +301,71 @@ pub async fn run_gossip_loop(
                 }
             }
 
+            // Anti-entropy pull: every 30 s, pick one random active peer,
+            // send a SyncRequest, and merge the SyncResponse into our state.
             _ = anti_entropy_timer.tick() => {
                 log::debug!("Anti-entropy sync timer fired");
-                // TODO: Pick one random active peer and send state.generate_sync_request()
+
+                // Pick one random non-banned active peer.
+                let maybe_peer = {
+                    let pl = peer_list.lock().await;
+                    let active: Vec<_> = pl
+                        .get_active_peers()
+                        .into_iter()
+                        .filter(|p| !p.is_banned)
+                        .collect();
+                    if active.is_empty() {
+                        None
+                    } else {
+                        use rand::seq::SliceRandom;
+                        active.choose(&mut rand::thread_rng()).map(|p| p.identity.clone())
+                    }
+                };
+
+                if let Some(peer) = maybe_peer {
+                    let sync_req = {
+                        let st = state.lock().await;
+                        st.generate_sync_request()
+                    };
+
+                    let send_result = {
+                        let mut tm = transport_manager.lock().await;
+                        tm.send_to(&peer, ProtocolMessage::SyncRequest(sync_req)).await
+                    };
+
+                    match send_result {
+                        Ok(()) => {
+                            log::debug!("Anti-entropy SyncRequest sent to {}", peer);
+                            let response = {
+                                let mut tm = transport_manager.lock().await;
+                                tokio::time::timeout(
+                                    Duration::from_secs(10),
+                                    tm.recv_any(),
+                                ).await
+                            };
+                            match response {
+                                Ok(Some((from_peer, ProtocolMessage::SyncResponse(resp)))) if from_peer == peer => {
+                                    log::debug!(
+                                        "Anti-entropy SyncResponse from {}: {} envelope(s)",
+                                        peer,
+                                        resp.missing_envelopes.len()
+                                    );
+                                    let mut st = state.lock().await;
+                                    st.handle_sync_response(resp);
+                                }
+                                Ok(Some(_)) => {
+                                    log::debug!("Anti-entropy: unexpected message from peer, ignoring");
+                                }
+                                Ok(None) | Err(_) => {
+                                    log::debug!("Anti-entropy: no response from {} within timeout", peer);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::debug!("Anti-entropy SyncRequest to {} failed: {:?}", peer, e);
+                        }
+                    }
+                }
             }
 
             _ = ban_check_timer.tick() => {
@@ -560,6 +622,47 @@ mod tests {
         let id = [0xABu8; 32];
         assert!(!bloom.check_and_add(&id)); // first time: new
         assert!(bloom.check_and_add(&id)); // second time: already seen
+    }
+
+    // ── Anti-entropy pull tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_anti_entropy_no_peers_skips_sync() {
+        let state = GossipState::new();
+        let req = state.generate_sync_request();
+        assert_eq!(req.known_message_ids.len(), 0);
+    }
+
+    #[test]
+    fn test_anti_entropy_sync_request_contains_all_known_ids() {
+        let mut state = GossipState::new();
+        state.add_envelope(mock_envelope(0x01)).unwrap();
+        state.add_envelope(mock_envelope(0x02)).unwrap();
+        state.add_envelope(mock_envelope(0x03)).unwrap();
+
+        let req = state.generate_sync_request();
+        assert_eq!(req.known_message_ids.len(), 3);
+        for prefix in [[0x01u8; 4], [0x02u8; 4], [0x03u8; 4]] {
+            assert!(req.known_message_ids.contains(&prefix));
+        }
+    }
+
+    #[test]
+    fn test_anti_entropy_handle_sync_response_merges_missing() {
+        let mut local = GossipState::new();
+        local.add_envelope(mock_envelope(0xAA)).unwrap();
+
+        let mut remote = GossipState::new();
+        remote.add_envelope(mock_envelope(0xAA)).unwrap();
+        remote.add_envelope(mock_envelope(0xBB)).unwrap();
+        remote.add_envelope(mock_envelope(0xCC)).unwrap();
+
+        let req = local.generate_sync_request();
+        let resp = remote.handle_sync_request(&req);
+        assert_eq!(resp.missing_envelopes.len(), 2);
+
+        local.handle_sync_response(resp);
+        assert_eq!(local.active_queue.len(), 3);
     }
 
     // ── GossipError integration on process_transaction_envelope ─────────────────
