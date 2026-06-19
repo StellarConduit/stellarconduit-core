@@ -44,11 +44,13 @@ impl GossipState {
     }
 
     pub fn add_envelope(&mut self, env: TransactionEnvelope) -> Result<(), GossipError> {
-        self.active_queue.push(ProtocolMessage::Transaction(env));
-        // The Normal-tier capacity cap (issue #62) is not yet enforced, so an
-        // envelope can never be dropped here. Once the cap lands, this will
-        // return `GossipError::NormalQueueOverflow { dropped_id }` when the
-        // oldest envelope is evicted to make room.
+        if let Some(ProtocolMessage::Transaction(dropped_env)) =
+            self.active_queue.push(ProtocolMessage::Transaction(env))
+        {
+            return Err(GossipError::NormalQueueOverflow {
+                dropped_id: dropped_env.message_id,
+            });
+        }
         Ok(())
     }
 
@@ -202,23 +204,22 @@ pub async fn execute_fanout_round(
     let f = fanout_calc.calculate(active_peers.len(), None);
     let recipients = select_random_peers(&active_peers, f);
 
-    // 3. Drain up to FANOUT_BATCH_SIZE envelopes from the queue.
-    let mut batch: Vec<TransactionEnvelope> = Vec::with_capacity(FANOUT_BATCH_SIZE);
-    {
+    // 3. Drain up to FANOUT_BATCH_SIZE envelopes from the Normal tier, sorted
+    //    by urgency score so the most time-critical transactions go first.
+    let batch: Vec<TransactionEnvelope> = {
         let mut st = state.lock().await;
-        for _ in 0..FANOUT_BATCH_SIZE {
-            match st.active_queue.pop() {
-                Some(ProtocolMessage::Transaction(env)) => batch.push(env),
-                Some(other) => {
-                    // Non-transaction messages: put back via re-push is not possible without
-                    // re-enqueueing, so we just forward them as-is by re-adding.
-                    st.active_queue.push(other);
-                    break;
+        st.active_queue
+            .drain_batch(FANOUT_BATCH_SIZE)
+            .into_iter()
+            .filter_map(|msg| {
+                if let ProtocolMessage::Transaction(env) = msg {
+                    Some(env)
+                } else {
+                    None
                 }
-                None => break,
-            }
-        }
-    }
+            })
+            .collect()
+    };
 
     // 4. For each envelope, apply bloom dedup + TTL, then send to recipients.
     let mut forwarded = 0u64;
