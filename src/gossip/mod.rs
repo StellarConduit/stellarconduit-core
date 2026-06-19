@@ -5,3 +5,6 @@ pub mod protocol;
 pub mod queue;
 pub mod round;
 pub mod strike_tracker;
+
+pub use errors::GossipError;
+pub use protocol::GossipLoopMetrics;

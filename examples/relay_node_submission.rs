@@ -1,25 +1,52 @@
+use async_trait::async_trait;
 use stellarconduit_core::message::types::TransactionEnvelope;
-use stellarconduit_core::relay::RelayNode;
-use stellarconduit_core::relay::StellarRpcClient;
+use stellarconduit_core::relay::{RelayNode, RpcError, StellarRpcClient};
 
 struct ExampleRpcClient;
 
+#[async_trait]
 impl StellarRpcClient for ExampleRpcClient {
-    fn submit_transaction(&self, tx_xdr: &str) -> Result<String, String> {
+    async fn submit_transaction(&self, tx_xdr: &str) -> Result<String, RpcError> {
         println!(
             "Submitting transaction: {}...",
             &tx_xdr[..20.min(tx_xdr.len())]
         );
-        // In production this would call the Stellar RPC endpoint
-        Ok("example_tx_hash".to_string())
+        Ok(hex::encode([0xABu8; 32]))
+    }
+    async fn get_account_sequence(&self, _: &str) -> Result<u64, RpcError> {
+        Ok(0)
+    }
+    async fn get_ledger_sequence(&self) -> Result<u64, RpcError> {
+        Ok(1234)
+    }
+    async fn get_ledger_hash(&self) -> Result<String, RpcError> {
+        Ok(hex::encode([0xCDu8; 32]))
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    let rpc_client = Box::new(ExampleRpcClient);
-    let mut relay = RelayNode::new(1000, rpc_client);
+    let seed_hex = std::env::var("SC_RELAY_SIGNING_KEY_HEX").map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "set SC_RELAY_SIGNING_KEY_HEX to a 32-byte hex relay signing seed",
+        )
+    })?;
+    let seed_bytes = hex::decode(seed_hex)?;
+    let seed: [u8; 32] = seed_bytes.try_into().map_err(|bytes: Vec<u8>| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "SC_RELAY_SIGNING_KEY_HEX must decode to 32 bytes, got {}",
+                bytes.len()
+            ),
+        )
+    })?;
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let verifying_key = signing_key.verifying_key();
+    let mut relay = RelayNode::new(1000, Box::new(ExampleRpcClient), signing_key);
 
     let envelope = TransactionEnvelope {
         message_id: [1u8; 32],
@@ -34,10 +61,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Origin: {:?}", hex::encode(&envelope.origin_pubkey[..8]));
     println!("Timestamp: {}", envelope.timestamp);
 
-    match relay.process_envelope(&envelope) {
-        Ok(tx_hash) => {
+    match relay.process_envelope(&envelope).await {
+        Ok(proof) => {
             println!("✓ Transaction submitted successfully!");
-            println!("Transaction hash: {}", tx_hash);
+            println!("Proof sequence: {}", proof.sequence);
+            println!(
+                "Proof verifies: {}",
+                proof.verify(&verifying_key, &[0xABu8; 32])
+            );
         }
         Err(e) => {
             eprintln!("✗ Failed to process envelope: {}", e);

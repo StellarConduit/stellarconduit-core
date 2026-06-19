@@ -58,6 +58,7 @@ async fn test_strike_tracking_banning() {
         &mut strike_tracker,
         peer_list.clone(),
         transport_manager.clone(),
+        None,
     )
     .await;
     assert!(result1.is_ok());
@@ -68,6 +69,7 @@ async fn test_strike_tracking_banning() {
         &mut strike_tracker,
         peer_list.clone(),
         transport_manager.clone(),
+        None,
     )
     .await;
     assert!(result2.is_ok());
@@ -78,6 +80,7 @@ async fn test_strike_tracking_banning() {
         &mut strike_tracker,
         peer_list.clone(),
         transport_manager.clone(),
+        None,
     )
     .await;
     assert!(result3.is_ok());
@@ -89,6 +92,7 @@ async fn test_strike_tracking_banning() {
         &mut strike_tracker,
         peer_list.clone(),
         transport_manager.clone(),
+        None,
     )
     .await;
     assert!(result4.is_err()); // Should return Err with peer identity
@@ -120,6 +124,7 @@ async fn test_valid_signature_clears_strikes() {
         &mut strike_tracker,
         peer_list.clone(),
         transport_manager.clone(),
+        None,
     )
     .await
     .unwrap();
@@ -128,6 +133,7 @@ async fn test_valid_signature_clears_strikes() {
         &mut strike_tracker,
         peer_list.clone(),
         transport_manager.clone(),
+        None,
     )
     .await
     .unwrap();
@@ -141,6 +147,7 @@ async fn test_valid_signature_clears_strikes() {
         &mut strike_tracker,
         peer_list.clone(),
         transport_manager.clone(),
+        None,
     )
     .await
     .unwrap();
@@ -192,6 +199,7 @@ async fn test_multiple_peers_separate_strikes() {
             &mut strike_tracker,
             peer_list.clone(),
             transport_manager.clone(),
+            None,
         )
         .await
         .ok();
@@ -205,6 +213,7 @@ async fn test_multiple_peers_separate_strikes() {
             &mut strike_tracker,
             peer_list.clone(),
             transport_manager.clone(),
+            None,
         )
         .await
         .ok();

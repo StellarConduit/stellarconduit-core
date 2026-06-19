@@ -19,4 +19,7 @@ pub enum DbError {
 
     #[error("Invalid message ID format")]
     InvalidMessageId,
+
+    #[error("Invalid relay proof format: {0}")]
+    InvalidRelayProof(String),
 }

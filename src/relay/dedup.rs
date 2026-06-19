@@ -1,10 +1,11 @@
 use crate::gossip::bloom::SlidingBloomFilter;
+use crate::message::RelayChainProof;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 
 pub struct RelayDeduplicator {
     seen_ids: SlidingBloomFilter,
-    result_cache: LruCache<[u8; 32], String>, // message_id -> stellar tx hash
+    result_cache: LruCache<[u8; 32], RelayChainProof>, // message_id -> relay proof
 }
 
 impl RelayDeduplicator {
@@ -27,30 +28,38 @@ impl RelayDeduplicator {
     }
 
     /// Check if we've already processed this message_id.
-    /// Returns Some(tx_hash) if already submitted, None if new.
+    /// Returns Some(proof) if already submitted, None if new.
     ///
-    /// This method only checks the LRU cache, which stores the exact message_id -> tx_hash mapping.
+    /// This method only checks the LRU cache, which stores the exact message_id -> proof mapping.
     /// The bloom filter is used in mark_submitted() to prevent duplicate additions to the cache.
-    /// If an item is not in the cache, we cannot return a hash, so we treat it as new.
-    pub fn check(&mut self, message_id: &[u8; 32]) -> Option<String> {
+    /// If an item is not in the cache, we cannot return a proof, so we treat it as new.
+    pub fn check(&mut self, message_id: &[u8; 32]) -> Option<RelayChainProof> {
         // Check the LRU cache for an exact match
-        // If found, return the cached transaction hash
+        // If found, return the cached relay proof
         self.result_cache.get(message_id).cloned()
     }
 
-    /// Record that a message_id has been successfully submitted with the given tx hash.
-    pub fn mark_submitted(&mut self, message_id: [u8; 32], tx_hash: String) {
+    /// Record that a message_id has been successfully submitted with the given relay proof.
+    pub fn mark_submitted(&mut self, message_id: [u8; 32], proof: RelayChainProof) {
         // Add to bloom filter
         self.seen_ids.add(&message_id);
 
         // Add to LRU cache
-        self.result_cache.put(message_id, tx_hash);
+        self.result_cache.put(message_id, proof);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn proof(byte: u8) -> RelayChainProof {
+        RelayChainProof {
+            signature: [byte; 64],
+            chain_hash: [byte; 32],
+            sequence: u64::from(byte),
+        }
+    }
 
     #[test]
     fn test_check_returns_none_for_new_message_id() {
@@ -64,11 +73,11 @@ mod tests {
     fn test_check_returns_hash_after_mark_submitted() {
         let mut dedup = RelayDeduplicator::new(1000);
         let message_id = [1u8; 32];
-        let tx_hash = "abc123".to_string();
+        let relay_proof = proof(1);
 
         assert_eq!(dedup.check(&message_id), None);
-        dedup.mark_submitted(message_id, tx_hash.clone());
-        assert_eq!(dedup.check(&message_id), Some(tx_hash));
+        dedup.mark_submitted(message_id, relay_proof.clone());
+        assert_eq!(dedup.check(&message_id), Some(relay_proof));
     }
 
     #[test]
@@ -76,14 +85,14 @@ mod tests {
         let mut dedup = RelayDeduplicator::new(1000);
         let msg1 = [1u8; 32];
         let msg2 = [2u8; 32];
-        let hash1 = "hash1".to_string();
-        let hash2 = "hash2".to_string();
+        let proof1 = proof(1);
+        let proof2 = proof(2);
 
-        dedup.mark_submitted(msg1, hash1.clone());
-        dedup.mark_submitted(msg2, hash2.clone());
+        dedup.mark_submitted(msg1, proof1.clone());
+        dedup.mark_submitted(msg2, proof2.clone());
 
-        assert_eq!(dedup.check(&msg1), Some(hash1));
-        assert_eq!(dedup.check(&msg2), Some(hash2));
+        assert_eq!(dedup.check(&msg1), Some(proof1));
+        assert_eq!(dedup.check(&msg2), Some(proof2));
     }
 
     #[test]
@@ -94,17 +103,17 @@ mod tests {
         for i in 0..25 {
             let mut msg_id = [0u8; 32];
             msg_id[0] = i as u8;
-            let tx_hash = format!("hash_{}", i);
-            dedup.mark_submitted(msg_id, tx_hash.clone());
+            let relay_proof = proof(i as u8);
+            dedup.mark_submitted(msg_id, relay_proof.clone());
 
             // Verify we can still retrieve it immediately
-            assert_eq!(dedup.check(&msg_id), Some(tx_hash));
+            assert_eq!(dedup.check(&msg_id), Some(relay_proof));
         }
 
         // Verify recent items are still accessible (they should be in the cache)
         let mut msg20 = [0u8; 32];
         msg20[0] = 20;
-        assert_eq!(dedup.check(&msg20), Some("hash_20".to_string()));
+        assert_eq!(dedup.check(&msg20), Some(proof(20)));
 
         // Verify that bloom filter rotation doesn't break the ability to detect duplicates
         // Even if an item was evicted from cache, the bloom filter should still indicate
@@ -115,8 +124,8 @@ mod tests {
         // The important thing is that mark_submitted still works
         let result = dedup.check(&msg5);
         // If it's Some, verify it's correct; if None, that's okay (cache eviction)
-        if let Some(hash) = result {
-            assert_eq!(hash, "hash_5".to_string());
+        if let Some(relay_proof) = result {
+            assert_eq!(relay_proof, proof(5));
         }
     }
 }

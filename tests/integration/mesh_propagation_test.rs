@@ -72,7 +72,7 @@ fn make_envelope(base_id: u8, idx: u32, timestamp: u64) -> TransactionEnvelope {
 fn populate_cluster_node(state: &mut GossipState, base_id: u8, count: usize) {
     for i in 0..count {
         let env = make_envelope(base_id, i as u32, i as u64);
-        state.add_envelope(env);
+        let _ = state.add_envelope(env);
     }
 }
 

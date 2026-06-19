@@ -1,5 +1,8 @@
+use ed25519_dalek::SigningKey;
 use stellarconduit_core::{
-    message::types::TransactionEnvelope, peer::peer_node::Peer, persistence::db::MeshDatabase,
+    message::{types::TransactionEnvelope, RelayChainProof},
+    peer::peer_node::Peer,
+    persistence::db::MeshDatabase,
 };
 
 fn create_mock_envelope(id: u8) -> TransactionEnvelope {
@@ -23,6 +26,13 @@ fn create_mock_peer(id: u8) -> Peer {
     peer.bytes_sent = 1024;
     peer.bytes_received = 2048;
     peer
+}
+
+fn create_relay_proof() -> (SigningKey, [u8; 32], RelayChainProof) {
+    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    let tx_id = [0xAB; 32];
+    let proof = RelayChainProof::sign(&signing_key, &tx_id, &[0xCD; 32], 1234);
+    (signing_key, tx_id, proof)
 }
 
 #[tokio::test]
@@ -118,4 +128,35 @@ async fn test_delete_envelope() {
     let loaded_after = db.load_pending_envelopes().await.unwrap();
     assert_eq!(loaded_after.len(), 1);
     assert_eq!(loaded_after[0].message_id, env_2.message_id);
+}
+
+#[tokio::test]
+async fn test_save_and_get_relay_proof() {
+    let db = MeshDatabase::init(":memory:").await.unwrap();
+    let (signing_key, tx_id, proof) = create_relay_proof();
+
+    db.save_relay_proof(&tx_id, &proof)
+        .await
+        .expect("Failed to save relay proof");
+
+    let loaded = db
+        .get_relay_proof(&tx_id)
+        .await
+        .expect("Failed to load relay proof")
+        .expect("relay proof should exist");
+
+    assert_eq!(loaded, proof);
+    assert!(loaded.verify(&signing_key.verifying_key(), &tx_id));
+}
+
+#[tokio::test]
+async fn test_get_relay_proof_missing_returns_none() {
+    let db = MeshDatabase::init(":memory:").await.unwrap();
+
+    let missing = db
+        .get_relay_proof(&[0xEF; 32])
+        .await
+        .expect("missing relay proof lookup should not fail");
+
+    assert_eq!(missing, None);
 }

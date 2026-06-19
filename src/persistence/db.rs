@@ -1,12 +1,20 @@
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_rusqlite::Connection;
 
 use crate::message::types::{ProtocolMessage, TransactionEnvelope};
+use crate::message::RelayChainProof;
 use crate::peer::peer_node::Peer;
 use crate::persistence::errors::DbError;
 
 pub struct MeshDatabase {
     conn: Connection,
+}
+
+pub struct PersistedBan {
+    pub pubkey: [u8; 32],
+    pub expires_at: u64,
+    pub reason: String,
 }
 
 impl MeshDatabase {
@@ -43,6 +51,20 @@ impl MeshDatabase {
                     envelope_bytes BLOB,
                     ttl_hops INTEGER,
                     timestamp_sec INTEGER
+                );
+
+                CREATE TABLE IF NOT EXISTS relay_proofs (
+                    tx_id BLOB PRIMARY KEY,
+                    signature BLOB NOT NULL,
+                    chain_hash BLOB NOT NULL,
+                    sequence INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS banned_peers (
+                    pubkey      BLOB NOT NULL PRIMARY KEY,
+                    banned_at   INTEGER NOT NULL,
+                    expires_at  INTEGER NOT NULL,
+                    reason      TEXT NOT NULL
                 );",
             )?;
             Ok(())
@@ -204,6 +226,160 @@ impl MeshDatabase {
         Ok(count)
     }
 
+    pub async fn save_relay_proof(
+        &self,
+        tx_id: &[u8; 32],
+        proof: &RelayChainProof,
+    ) -> Result<(), DbError> {
+        let sequence = i64::try_from(proof.sequence).map_err(|_| {
+            DbError::InvalidRelayProof("sequence exceeds SQLite INTEGER range".to_string())
+        })?;
+        let tx_id = *tx_id;
+        let signature = proof.signature;
+        let chain_hash = proof.chain_hash;
+
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO relay_proofs (tx_id, signature, chain_hash, sequence)
+                    VALUES (?1, ?2, ?3, ?4)
+                    ON CONFLICT(tx_id) DO UPDATE SET
+                        signature=excluded.signature,
+                        chain_hash=excluded.chain_hash,
+                        sequence=excluded.sequence",
+                    rusqlite::params![&tx_id[..], &signature[..], &chain_hash[..], sequence],
+                )?;
+                Ok(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn get_relay_proof(
+        &self,
+        tx_id: &[u8; 32],
+    ) -> Result<Option<RelayChainProof>, DbError> {
+        let tx_id = *tx_id;
+        let row = self
+            .conn
+            .call(move |conn| {
+                use rusqlite::OptionalExtension;
+
+                Ok(conn
+                    .query_row(
+                        "SELECT signature, chain_hash, sequence FROM relay_proofs WHERE tx_id = ?1",
+                        rusqlite::params![&tx_id[..]],
+                        |row| {
+                            Ok((
+                                row.get::<_, Vec<u8>>(0)?,
+                                row.get::<_, Vec<u8>>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()?)
+            })
+            .await?;
+
+        row.map(|(signature, chain_hash, sequence)| {
+            let signature = vec_to_array::<64>(signature, "signature")?;
+            let chain_hash = vec_to_array::<32>(chain_hash, "chain_hash")?;
+            let sequence = u64::try_from(sequence).map_err(|_| {
+                DbError::InvalidRelayProof("sequence cannot be negative".to_string())
+            })?;
+
+            Ok(RelayChainProof {
+                signature,
+                chain_hash,
+                sequence,
+            })
+        })
+        .transpose()
+    }
+
+    /// Persist a newly banned peer to disk.
+    pub async fn save_ban(
+        &self,
+        pubkey: &[u8; 32],
+        expires_at: u64,
+        reason: &str,
+    ) -> Result<(), DbError> {
+        let banned_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let id = *pubkey;
+        let reason = reason.to_string();
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO banned_peers (pubkey, banned_at, expires_at, reason)
+                    VALUES (?1, ?2, ?3, ?4)
+                    ON CONFLICT(pubkey) DO UPDATE SET
+                        banned_at=excluded.banned_at,
+                        expires_at=excluded.expires_at,
+                        reason=excluded.reason",
+                    rusqlite::params![id, banned_at as i64, expires_at as i64, reason],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Remove a ban record (called when a ban expires or is manually lifted).
+    pub async fn remove_ban(&self, pubkey: &[u8; 32]) -> Result<(), DbError> {
+        let id = *pubkey;
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "DELETE FROM banned_peers WHERE pubkey = ?1",
+                    rusqlite::params![id],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Load all bans that have not yet expired.
+    pub async fn load_active_bans(&self) -> Result<Vec<PersistedBan>, DbError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.conn
+            .call(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT pubkey, expires_at, reason FROM banned_peers WHERE expires_at > ?1",
+                )?;
+                let ban_iter = stmt.query_map(rusqlite::params![now as i64], |row| {
+                    let pubkey_vec: Vec<u8> = row.get(0)?;
+                    let expires_at: i64 = row.get(1)?;
+                    let reason: String = row.get(2)?;
+                    Ok((pubkey_vec, expires_at, reason))
+                })?;
+
+                let mut bans = Vec::new();
+                for result in ban_iter {
+                    let (pubkey_vec, expires_at, reason) = result?;
+                    let mut pubkey = [0u8; 32];
+                    if pubkey_vec.len() == 32 {
+                        pubkey.copy_from_slice(&pubkey_vec);
+                    }
+                    bans.push(PersistedBan {
+                        pubkey,
+                        expires_at: expires_at as u64,
+                        reason,
+                    });
+                }
+                Ok(bans)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn mark_peer_offline(&self, pubkey: &[u8; 32]) -> Result<usize, DbError> {
         let id_val = *pubkey;
         let count = self
@@ -288,6 +464,18 @@ impl MeshDatabase {
                         envelope_bytes BLOB,
                         ttl_hops INTEGER,
                         timestamp_sec INTEGER
+                    );
+                    CREATE TABLE IF NOT EXISTS relay_proofs (
+                        tx_id BLOB PRIMARY KEY,
+                        signature BLOB NOT NULL,
+                        chain_hash BLOB NOT NULL,
+                        sequence INTEGER NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS banned_peers (
+                        pubkey      BLOB NOT NULL PRIMARY KEY,
+                        banned_at   INTEGER NOT NULL,
+                        expires_at  INTEGER NOT NULL,
+                        reason      TEXT NOT NULL
                     );",
                 )?;
                 Ok(Ok::<(), rusqlite::Error>(())?)
@@ -343,5 +531,112 @@ impl MeshDatabase {
             })
             .await
             .unwrap()
+    }
+}
+
+fn vec_to_array<const N: usize>(bytes: Vec<u8>, label: &str) -> Result<[u8; N], DbError> {
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        DbError::InvalidRelayProof(format!("{label} must be {N} bytes, got {}", bytes.len()))
+    })
+}
+
+#[cfg(test)]
+mod ban_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+
+    use crate::discovery::peer_list::PeerList;
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    #[tokio::test]
+    async fn test_ban_persisted_to_db() {
+        let db = MeshDatabase::init(":memory:").await.unwrap();
+        let pubkey = [1u8; 32];
+        let expires_at = now_secs() + 3600;
+
+        db.save_ban(&pubkey, expires_at, "invalid signatures")
+            .await
+            .unwrap();
+
+        let bans = db.load_active_bans().await.unwrap();
+        assert_eq!(bans.len(), 1);
+        assert_eq!(bans[0].pubkey, pubkey);
+        assert_eq!(bans[0].expires_at, expires_at);
+        assert_eq!(bans[0].reason, "invalid signatures");
+    }
+
+    #[tokio::test]
+    async fn test_ban_removed_after_expiry() {
+        let db = Arc::new(MeshDatabase::init(":memory:").await.unwrap());
+        let pubkey = [2u8; 32];
+        let expires_at = now_secs() + 1;
+
+        db.save_ban(&pubkey, expires_at, "short ban").await.unwrap();
+
+        let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
+        {
+            let mut guard = peer_list.lock().await;
+            guard.insert_or_update(pubkey, 0);
+            guard.ban_peer(&pubkey, 1);
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Simulate the ban_check_timer branch in run_gossip_loop
+        let unbanned = {
+            let mut guard = peer_list.lock().await;
+            guard.check_ban_expirations()
+        };
+        for peer in &unbanned {
+            db.remove_ban(&peer.pubkey).await.unwrap();
+        }
+
+        let bans = db.load_active_bans().await.unwrap();
+        assert!(bans.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ban_restored_on_startup() {
+        let db = MeshDatabase::init(":memory:").await.unwrap();
+        let pubkey = [3u8; 32];
+        let expires_at = now_secs() + 3600;
+
+        db.save_ban(&pubkey, expires_at, "restore test")
+            .await
+            .unwrap();
+
+        let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
+        crate::security::peer_ban::restore_bans_from_db(&peer_list, &db)
+            .await
+            .unwrap();
+
+        let guard = peer_list.lock().await;
+        assert!(guard.is_peer_banned(&pubkey));
+    }
+
+    #[tokio::test]
+    async fn test_expired_ban_not_restored() {
+        let db = MeshDatabase::init(":memory:").await.unwrap();
+        let pubkey = [4u8; 32];
+        // expires_at in the past — load_active_bans will not return it
+        let expires_at = now_secs().saturating_sub(10);
+
+        db.save_ban(&pubkey, expires_at, "old ban").await.unwrap();
+
+        let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
+        crate::security::peer_ban::restore_bans_from_db(&peer_list, &db)
+            .await
+            .unwrap();
+
+        let guard = peer_list.lock().await;
+        assert!(!guard.is_peer_banned(&pubkey));
     }
 }

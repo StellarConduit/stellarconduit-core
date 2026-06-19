@@ -64,7 +64,29 @@ impl GossipScheduler {
             Duration::from_millis(ACTIVE_ROUND_INTERVAL_MS)
         }
     }
+
+    /// Returns the current round interval (alias for `current_interval`).
+    pub fn get_interval(&self) -> Duration {
+        self.current_interval()
+    }
+
+    /// Simulates the passage of time by moving both internal timestamps backward.
+    /// Used in tests that need to fast-forward the scheduler state.
+    pub fn advance_time(&mut self, by: Duration) {
+        self.last_round_time = self
+            .last_round_time
+            .checked_sub(by)
+            .unwrap_or(self.last_round_time);
+        self.last_active_msg_time = self
+            .last_active_msg_time
+            .checked_sub(by)
+            .unwrap_or(self.last_active_msg_time);
+    }
 }
+
+/// Public alias so external test files can refer to `RoundScheduler` interchangeably
+/// with the internal `GossipScheduler` name.
+pub type RoundScheduler = GossipScheduler;
 
 impl Default for GossipScheduler {
     fn default() -> Self {
