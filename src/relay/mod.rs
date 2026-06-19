@@ -1,4 +1,5 @@
 pub mod dedup;
+pub mod rpc_client;
 
 use crate::message::types::TransactionEnvelope;
 use crate::relay::dedup::RelayDeduplicator;

@@ -50,11 +50,15 @@ uuid = { version = "1.8", features = ["v4"] }
 # mDNS for WiFi-Direct discovery
 mdns-sd = "0.11"
 
+# HTTP Client for RPC
+reqwest = { version = "0.11", features = ["json"] }
+
 [dev-dependencies]
 tokio-test = "0.4"
 mockall = "0.12"
 criterion = "0.5"  # For benchmarking
 wiremock = "0.6"
+serde_json = "1.0"
 
 [[bin]]
 name = "stellarconduitd"
