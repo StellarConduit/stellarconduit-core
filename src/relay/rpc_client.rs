@@ -47,11 +47,11 @@ pub struct RpcClient {
 
 impl RpcClient {
     /// Create a new RPC client with the given endpoint URL
-    /// 
+    ///
     /// # Example
     /// ```
     /// use stellarconduit_core::relay::rpc_client::RpcClient;
-    /// 
+    ///
     /// let client = RpcClient::new("https://soroban-testnet.stellar.org");
     /// ```
     pub fn new(endpoint: impl Into<String>) -> Self {
@@ -62,14 +62,14 @@ impl RpcClient {
     }
 
     /// Submit a base64-encoded XDR transaction to the Soroban network.
-    /// 
+    ///
     /// # Arguments
     /// * `tx_xdr` - The base64-encoded Stellar transaction XDR
-    /// 
+    ///
     /// # Returns
     /// * `Ok(String)` - The transaction hash on successful submission
     /// * `Err(RpcError)` - RPC error details if submission fails
-    /// 
+    ///
     /// # Example
     /// ```no_run
     /// # use stellarconduit_core::relay::rpc_client::RpcClient;
