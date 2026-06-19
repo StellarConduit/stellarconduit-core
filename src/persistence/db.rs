@@ -60,6 +60,18 @@ impl MeshDatabase {
         Ok(Self { conn })
     }
 
+    /// Flush WAL to the main database file and close the connection pool.
+    pub async fn close(&self) -> Result<(), DbError> {
+        self.conn
+            .call(|conn| {
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+                Ok(())
+            })
+            .await?;
+        log::info!("Database: WAL checkpoint flushed and pool closed");
+        Ok(())
+    }
+
     /// Insert or update a Peer in the database.
     pub async fn save_peer(&self, peer: &Peer) -> Result<(), DbError> {
         let pubkey = peer.identity.pubkey;
