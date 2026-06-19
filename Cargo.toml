@@ -53,6 +53,9 @@ mdns-sd = "0.11"
 # HTTP Client for RPC
 reqwest = { version = "0.11", features = ["json"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus = { version = "0.9.11", features = ["vendored"] }
+
 [dev-dependencies]
 tokio-test = "0.4"
 mockall = "0.12"
