@@ -428,7 +428,9 @@ impl TransportManager {
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
             .await
             .map_err(|_| TransportError::ConnectionRefused)?;
-        let bound_addr = listener.local_addr().map_err(|_| TransportError::BrokenPipe)?;
+        let bound_addr = listener
+            .local_addr()
+            .map_err(|_| TransportError::BrokenPipe)?;
 
         let peer_count = Arc::clone(&self.peer_count);
         let max_peers = self.max_peers;
@@ -528,7 +530,11 @@ impl TransportManager {
         log::debug!("ble_fallback: connecting via BLE for peer");
         let mut c = BleCentral::new(peer.clone());
         c.connect().await?;
-        if self.active_connections.insert(peer.pubkey, Box::new(c)).is_none() {
+        if self
+            .active_connections
+            .insert(peer.pubkey, Box::new(c))
+            .is_none()
+        {
             self.peer_count.fetch_add(1, Ordering::SeqCst);
         }
         Ok(())
@@ -932,11 +938,7 @@ mod tests {
             let _ = TcpStream::connect(addr).await;
         });
 
-        let result = tokio::time::timeout(
-            Duration::from_millis(500),
-            rx.recv(),
-        )
-        .await;
+        let result = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
         assert!(result.is_ok(), "timed out waiting for inbound connection");
         assert!(result.unwrap().is_some());
     }
@@ -977,7 +979,12 @@ mod tests {
         let inbox = Arc::new(Mutex::new(Vec::new()));
         mgr.register_inbound(
             p.clone(),
-            Box::new(MockConnection::new(p.clone(), recv_calls, sent_messages, inbox)),
+            Box::new(MockConnection::new(
+                p.clone(),
+                recv_calls,
+                sent_messages,
+                inbox,
+            )),
         );
         assert_eq!(mgr.peer_count.load(Ordering::SeqCst), 1);
 
@@ -986,6 +993,9 @@ mod tests {
         let _ = TcpStream::connect(addr).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        assert!(rx.try_recv().is_err(), "connection should have been dropped");
+        assert!(
+            rx.try_recv().is_err(),
+            "connection should have been dropped"
+        );
     }
 }
