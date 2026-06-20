@@ -7,6 +7,8 @@ use clap::Parser;
 
 use stellarconduit_core::discovery::mdns::{DiscoveredPeer, MdnsDiscovery};
 use stellarconduit_core::discovery::peer_list::PeerList;
+use stellarconduit_core::peer::identity::PeerIdentity;
+use stellarconduit_core::transport::connection::Connection;
 use stellarconduit_core::transport::unified::{TransportManager, TransportPreference};
 
 #[derive(Parser, Debug)]
@@ -57,8 +59,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TODO: 2. Initialize Database (Issue #18)
     // TODO: 3. Start StatePruner (Issue #19)
 
-    // TODO: 4. Start TransportManager with WiFi-Direct listener (TCP) on `args.port`
-    let _transport_manager = Arc::new(Mutex::new(TransportManager::new(TransportPreference::Auto)));
+    // 4. Start TransportManager with WiFi-Direct listener (TCP) on `args.port`
+    let transport_manager = Arc::new(Mutex::new(TransportManager::new(TransportPreference::Auto)));
+
+    let (incoming_tx, mut incoming_rx) =
+        mpsc::channel::<(PeerIdentity, Box<dyn Connection + Send + Sync>)>(64);
+
+    let wifi_addr = {
+        let mgr = transport_manager.lock().await;
+        mgr.start_wifi_listener(args.port, incoming_tx).await?
+    };
+    log::info!("WiFi-Direct listener bound on {wifi_addr}");
+
+    let tm_inbound = transport_manager.clone();
+    tokio::spawn(async move {
+        while let Some((peer, conn)) = incoming_rx.recv().await {
+            tm_inbound.lock().await.register_inbound(peer, conn);
+        }
+    });
 
     let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
 
