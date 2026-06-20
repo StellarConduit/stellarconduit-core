@@ -975,7 +975,10 @@ mod tests {
         let routing_table = Arc::new(Mutex::new(RoutingTable::new(16, metrics.clone())));
         {
             let mut t = routing_table.lock().await;
-            t.insert([0x01u8; 32], vec![crate::peer::identity::PeerIdentity::new([0x01u8; 32])]);
+            t.insert(
+                [0x01u8; 32],
+                vec![crate::peer::identity::PeerIdentity::new([0x01u8; 32])],
+            );
         }
 
         let event_bus = TopologyEventBus::new(16);
@@ -1016,7 +1019,10 @@ mod tests {
         {
             let mut t = routing_table.lock().await;
             for i in 0u8..5 {
-                t.insert([i; 32], vec![crate::peer::identity::PeerIdentity::new([i; 32])]);
+                t.insert(
+                    [i; 32],
+                    vec![crate::peer::identity::PeerIdentity::new([i; 32])],
+                );
             }
         }
 
