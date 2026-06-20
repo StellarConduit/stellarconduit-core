@@ -48,7 +48,7 @@ pub fn apply_reward(peer: &mut Peer, reason: RewardReason) {
 /// Sort a peer slice in-place by reputation, descending.
 /// Call before passing to `select_next_hops` if reputation-based routing is desired.
 pub fn rank_by_reputation(peers: &mut [([u8; 32], u32)]) {
-    peers.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    peers.sort_unstable_by_key(|b| std::cmp::Reverse(b.1));
 }
 
 #[cfg(test)]
