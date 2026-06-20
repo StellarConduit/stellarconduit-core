@@ -11,6 +11,8 @@ use log::info;
 use crate::message::relay_proof::RelayChainProof;
 use crate::message::types::TransactionEnvelope;
 use crate::metrics::Metrics;
+use crate::peer::peer_node::Peer;
+use crate::peer::reputation::{apply_reward, RewardReason};
 use crate::relay::dedup::RelayDeduplicator;
 
 /// Errors returned by the Stellar RPC layer.
@@ -59,9 +61,13 @@ impl RelayNode {
     }
 
     /// Process a transaction envelope, checking for duplicates before submission.
+    ///
+    /// Pass `peer` to apply a reputation reward on the origin peer when the
+    /// transaction is successfully submitted for the first time.
     pub async fn process_envelope(
         &mut self,
         envelope: &TransactionEnvelope,
+        peer: Option<&mut Peer>,
     ) -> Result<RelayChainProof, RpcError> {
         if let Some(existing_proof) = self.deduplicator.check(&envelope.message_id) {
             info!(
@@ -96,6 +102,10 @@ impl RelayNode {
         let proof = RelayChainProof::sign(&self.signing_key, &tx_id, &chain_hash, sequence);
         self.deduplicator
             .mark_submitted(envelope.message_id, proof.clone());
+
+        if let Some(p) = peer {
+            apply_reward(p, RewardReason::SuccessfullyRoutedTx);
+        }
 
         Ok(proof)
     }
@@ -177,11 +187,11 @@ mod tests {
         );
         let envelope = create_test_envelope([1u8; 32]);
 
-        let proof1 = relay.process_envelope(&envelope).await.unwrap();
+        let proof1 = relay.process_envelope(&envelope, None).await.unwrap();
         assert_eq!(submit_count.load(Ordering::SeqCst), 1);
         assert!(proof1.verify(&verifying_key, &[0xABu8; 32]));
 
-        let proof2 = relay.process_envelope(&envelope).await.unwrap();
+        let proof2 = relay.process_envelope(&envelope, None).await.unwrap();
         assert_eq!(submit_count.load(Ordering::SeqCst), 1); // no second call
         assert_eq!(proof1, proof2);
     }
@@ -197,9 +207,9 @@ mod tests {
         );
         let envelope = create_test_envelope([1u8; 32]);
 
-        let p1 = relay.process_envelope(&envelope).await.unwrap();
-        let p2 = relay.process_envelope(&envelope).await.unwrap();
-        let p3 = relay.process_envelope(&envelope).await.unwrap();
+        let p1 = relay.process_envelope(&envelope, None).await.unwrap();
+        let p2 = relay.process_envelope(&envelope, None).await.unwrap();
+        let p3 = relay.process_envelope(&envelope, None).await.unwrap();
 
         assert_eq!(submit_count.load(Ordering::SeqCst), 1);
         assert_eq!(p1, p2);
@@ -217,11 +227,11 @@ mod tests {
         );
 
         relay
-            .process_envelope(&create_test_envelope([1u8; 32]))
+            .process_envelope(&create_test_envelope([1u8; 32]), None)
             .await
             .unwrap();
         relay
-            .process_envelope(&create_test_envelope([2u8; 32]))
+            .process_envelope(&create_test_envelope([2u8; 32]), None)
             .await
             .unwrap();
 
@@ -240,11 +250,11 @@ mod tests {
         );
 
         relay
-            .process_envelope(&create_test_envelope([1u8; 32]))
+            .process_envelope(&create_test_envelope([1u8; 32]), None)
             .await
             .unwrap();
         relay
-            .process_envelope(&create_test_envelope([2u8; 32]))
+            .process_envelope(&create_test_envelope([2u8; 32]), None)
             .await
             .unwrap();
 
@@ -282,7 +292,7 @@ mod tests {
         );
 
         let result = relay
-            .process_envelope(&create_test_envelope([3u8; 32]))
+            .process_envelope(&create_test_envelope([3u8; 32]), None)
             .await;
         assert!(matches!(result, Err(RpcError::TransactionRejected { .. })));
         assert_eq!(metrics.transactions_rejected.load(Ordering::Relaxed), 1);

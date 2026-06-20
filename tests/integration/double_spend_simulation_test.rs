@@ -86,7 +86,7 @@ impl TestNode {
             relay
                 .lock()
                 .await
-                .process_envelope(&envelope)
+                .process_envelope(&envelope, None)
                 .await
                 .map_err(|e| e.to_string())?;
         }
