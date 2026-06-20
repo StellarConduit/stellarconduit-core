@@ -7,8 +7,6 @@ use clap::Parser;
 
 use stellarconduit_core::discovery::mdns::{DiscoveredPeer, MdnsDiscovery};
 use stellarconduit_core::discovery::peer_list::PeerList;
-use stellarconduit_core::peer::identity::PeerIdentity;
-use stellarconduit_core::transport::connection::Connection;
 use stellarconduit_core::transport::unified::{TransportManager, TransportPreference};
 
 #[derive(Parser, Debug)]
@@ -62,8 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 4. Start TransportManager with WiFi-Direct listener (TCP) on `args.port`
     let transport_manager = Arc::new(Mutex::new(TransportManager::new(TransportPreference::Auto)));
 
-    let (incoming_tx, mut incoming_rx) =
-        mpsc::channel::<(PeerIdentity, Box<dyn Connection + Send + Sync>)>(64);
+    let (incoming_tx, mut incoming_rx) = mpsc::channel(64);
 
     let wifi_addr = {
         let mgr = transport_manager.lock().await;
