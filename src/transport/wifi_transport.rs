@@ -85,6 +85,19 @@ impl WifiDirectConnection {
         })
     }
 
+    /// Wraps an already-accepted `TcpStream` as a connected `WifiDirectConnection`
+    /// without performing a new outbound TCP connection.
+    pub fn from_stream(stream: TcpStream, peer: PeerIdentity) -> Self {
+        Self {
+            remote_peer: peer,
+            state: ConnectionState::Connected,
+            stream: Some(stream),
+            addr: None,
+            chunker: MessageChunker { mtu: WIFI_TCP_MTU },
+            reassembler: MessageReassembler::new(),
+        }
+    }
+
     /// Attempt to reconnect using exponential backoff.
     ///
     /// Tries up to `MAX_RECONNECT_ATTEMPTS`. On each failure the delay doubles
@@ -382,6 +395,27 @@ mod tests {
         let result = conn.reconnect().await;
         assert_eq!(result, Err(TransportError::ConnectionRefused));
         assert_eq!(conn.state(), ConnectionState::Disconnected);
+    }
+
+    // ── from_stream constructor ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_from_stream_wraps_accepted_tcp() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let peer = make_peer(0xCC);
+        let peer_clone = peer.clone();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            WifiDirectConnection::from_stream(stream, peer_clone)
+        });
+
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let conn = server_task.await.unwrap();
+
+        assert_eq!(conn.remote_peer(), peer);
+        assert_eq!(conn.state(), ConnectionState::Connected);
     }
 
     // ── disconnect clears state ────────────────────────────────────────────────
