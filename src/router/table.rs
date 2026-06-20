@@ -62,6 +62,35 @@ impl RoutingTable {
     pub fn is_empty(&self) -> bool {
         self.cache.is_empty()
     }
+
+    /// Remove all cached routes to or through `peer`.
+    pub fn invalidate(&mut self, peer: &[u8; 32]) {
+        self.cache.pop(peer);
+
+        let keys_to_remove: Vec<[u8; 32]> = self
+            .cache
+            .iter()
+            .filter(|(_, hops)| hops.iter().any(|h| &h.pubkey == peer))
+            .map(|(k, _)| *k)
+            .collect();
+
+        for key in keys_to_remove {
+            self.cache.pop(&key);
+        }
+
+        self.metrics
+            .routing_table_invalidations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Flush all cached routes (used on full topology restructure).
+    pub fn clear(&mut self) {
+        let count = self.cache.len() as u64;
+        self.cache.clear();
+        self.metrics
+            .routing_table_invalidations
+            .fetch_add(count, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -123,5 +152,65 @@ mod tests {
         table.insert(dest(0x03), vec![peer(0xCC)]);
         assert!(table.lookup(&dest(0x01)).is_some());
         assert!(table.lookup(&dest(0x02)).is_none());
+    }
+
+    #[test]
+    fn test_invalidate_removes_direct_route() {
+        let metrics = Metrics::new();
+        let mut table = RoutingTable::new(16, metrics.clone());
+        table.insert(dest(0xAA), vec![peer(0xBB)]);
+        table.invalidate(&dest(0xAA));
+        assert!(table.lookup(&dest(0xAA)).is_none());
+    }
+
+    #[test]
+    fn test_invalidate_removes_routes_via_peer() {
+        let metrics = Metrics::new();
+        let mut table = RoutingTable::new(16, metrics.clone());
+        // A→[B, C] and D→[B]
+        table.insert(dest(0xA0), vec![peer(0xBB), peer(0xCC)]);
+        table.insert(dest(0xD0), vec![peer(0xBB)]);
+        table.invalidate(&[0xBBu8; 32]);
+        assert!(table.lookup(&dest(0xA0)).is_none());
+        assert!(table.lookup(&dest(0xD0)).is_none());
+    }
+
+    #[test]
+    fn test_invalidate_leaves_unrelated_routes() {
+        let metrics = Metrics::new();
+        let mut table = RoutingTable::new(16, metrics.clone());
+        table.insert(dest(0xA0), vec![peer(0xBB)]);
+        table.insert(dest(0xC0), vec![peer(0xDD)]);
+        table.invalidate(&[0xBBu8; 32]);
+        assert!(table.lookup(&dest(0xA0)).is_none());
+        assert!(table.lookup(&dest(0xC0)).is_some());
+    }
+
+    #[test]
+    fn test_clear_flushes_all_entries() {
+        let metrics = Metrics::new();
+        let mut table = RoutingTable::new(16, metrics.clone());
+        for i in 0u8..10 {
+            table.insert(dest(i), vec![peer(i)]);
+        }
+        table.clear();
+        assert_eq!(table.len(), 0);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn test_routing_table_invalidations_metric_increments() {
+        let metrics = Metrics::new();
+        let mut table = RoutingTable::new(16, metrics.clone());
+        table.insert(dest(0x01), vec![peer(0xAA)]);
+        table.insert(dest(0x02), vec![peer(0xBB)]);
+        table.insert(dest(0x03), vec![peer(0xCC)]);
+        table.invalidate(&dest(0x01));
+        table.invalidate(&dest(0x02));
+        table.invalidate(&dest(0x03));
+        assert_eq!(
+            metrics.routing_table_invalidations.load(Ordering::Relaxed),
+            3
+        );
     }
 }

@@ -20,7 +20,8 @@ use crate::metrics::Metrics;
 use crate::peer::identity::PeerIdentity;
 use crate::peer::reputation::{apply_penalty, PenaltyReason};
 use crate::persistence::db::MeshDatabase;
-use crate::topology::events::TopologyEventBus;
+use crate::router::table::RoutingTable;
+use crate::topology::events::{TopologyEvent, TopologyEventBus};
 use crate::transport::unified::TransportManager;
 
 /// Threshold above which a SyncResponse is treated as a "macro-merge" event.
@@ -307,6 +308,7 @@ pub async fn run_gossip_loop(
     metrics: Arc<Metrics>,
     event_bus: Option<TopologyEventBus>,
     db: Option<Arc<MeshDatabase>>,
+    routing_table: Option<Arc<Mutex<RoutingTable>>>,
 ) {
     let fanout_calc = FanoutCalculator::new();
     let mut bloom = SlidingBloomFilter::new(10_000, 0.01);
@@ -440,10 +442,23 @@ pub async fn run_gossip_loop(
                 rx.recv().await.ok()
             }, if topology_events.is_some() => {
                 if let Some(event) = event {
-                    log::debug!("Topology event received: {:?}", event);
-                    // TODO: call routing_table.invalidate() once the routing table
-                    //       module is implemented.
-                    let _ = event;
+                    log::debug!("Topology event: {:?}. Invalidating routing table.", event);
+                    if let Some(ref rt) = routing_table {
+                        let peer_key = event.affected_peer_pubkey();
+                        let mut table = rt.lock().await;
+                        match event {
+                            TopologyEvent::PeerDisconnected { .. }
+                            | TopologyEvent::RelayLost { .. }
+                            | TopologyEvent::PeerUnreachable { .. } => {
+                                table.invalidate(&peer_key);
+                            }
+                            TopologyEvent::ClusterMerge { .. }
+                            | TopologyEvent::PartitionDetected { .. } => {
+                                table.clear();
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
         }
@@ -543,6 +558,7 @@ mod tests {
             metrics,
             None,
             None,
+            None,
         ));
         let result = timeout(Duration::from_millis(200), async {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -567,6 +583,7 @@ mod tests {
             peer_list,
             transport_manager,
             metrics,
+            None,
             None,
             None,
         ));
@@ -594,6 +611,7 @@ mod tests {
             peer_list,
             transport_manager,
             metrics,
+            None,
             None,
             None,
         ));
@@ -944,5 +962,87 @@ mod tests {
         .await;
 
         assert_eq!(metrics.envelopes_dropped_ttl.load(Ordering::Relaxed), 1);
+    }
+
+    // ── Issue #134: topology event → routing table invalidation ───────────────
+
+    #[tokio::test]
+    async fn test_topology_event_triggers_invalidation() {
+        use crate::router::table::RoutingTable;
+        use crate::topology::events::TopologyEventBus;
+
+        let metrics = Metrics::new();
+        let routing_table = Arc::new(Mutex::new(RoutingTable::new(16, metrics.clone())));
+        {
+            let mut t = routing_table.lock().await;
+            t.insert([0x01u8; 32], vec![crate::peer::identity::PeerIdentity::new([0x01u8; 32])]);
+        }
+
+        let event_bus = TopologyEventBus::new(16);
+
+        let handle = tokio::spawn(run_gossip_loop(
+            GossipScheduler::new(),
+            StrikeTracker::new(),
+            Arc::new(Mutex::new(GossipState::new())),
+            Arc::new(Mutex::new(PeerList::new(300))),
+            make_transport(),
+            metrics.clone(),
+            Some(event_bus.clone()),
+            None,
+            Some(routing_table.clone()),
+        ));
+
+        // Let the loop start and subscribe before publishing.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        event_bus.publish(crate::topology::events::TopologyEvent::PeerDisconnected {
+            peer_pubkey: [0x01u8; 32],
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.abort();
+
+        assert_eq!(
+            metrics.routing_table_invalidations.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cluster_merge_event_triggers_clear() {
+        use crate::router::table::RoutingTable;
+        use crate::topology::events::TopologyEventBus;
+
+        let metrics = Metrics::new();
+        let routing_table = Arc::new(Mutex::new(RoutingTable::new(16, metrics.clone())));
+        {
+            let mut t = routing_table.lock().await;
+            for i in 0u8..5 {
+                t.insert([i; 32], vec![crate::peer::identity::PeerIdentity::new([i; 32])]);
+            }
+        }
+
+        let event_bus = TopologyEventBus::new(16);
+
+        let handle = tokio::spawn(run_gossip_loop(
+            GossipScheduler::new(),
+            StrikeTracker::new(),
+            Arc::new(Mutex::new(GossipState::new())),
+            Arc::new(Mutex::new(PeerList::new(300))),
+            make_transport(),
+            metrics.clone(),
+            Some(event_bus.clone()),
+            None,
+            Some(routing_table.clone()),
+        ));
+
+        // Let the loop start and subscribe before publishing.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        event_bus.publish(crate::topology::events::TopologyEvent::ClusterMerge {
+            origin_pubkey: [0xAAu8; 32],
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.abort();
+
+        let t = routing_table.lock().await;
+        assert!(t.is_empty());
     }
 }

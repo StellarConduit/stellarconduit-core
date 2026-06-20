@@ -28,6 +28,7 @@ pub struct Metrics {
     pub routing_table_hits: AtomicU64,
     pub routing_table_misses: AtomicU64,
     pub routing_table_refreshes: AtomicU64,
+    pub routing_table_invalidations: AtomicU64,
 
     // Peer Management
     pub peers_banned: AtomicU64,
@@ -65,6 +66,7 @@ pub struct MetricsSnapshot {
     pub routing_table_hits: u64,
     pub routing_table_misses: u64,
     pub routing_table_refreshes: u64,
+    pub routing_table_invalidations: u64,
 
     // Peer Management
     pub peers_banned: u64,
@@ -100,6 +102,7 @@ impl Metrics {
             routing_table_hits: self.routing_table_hits.load(Ordering::Relaxed),
             routing_table_misses: self.routing_table_misses.load(Ordering::Relaxed),
             routing_table_refreshes: self.routing_table_refreshes.load(Ordering::Relaxed),
+            routing_table_invalidations: self.routing_table_invalidations.load(Ordering::Relaxed),
             peers_banned: self.peers_banned.load(Ordering::Relaxed),
             peers_unbanned: self.peers_unbanned.load(Ordering::Relaxed),
             peers_connected: self.peers_connected.load(Ordering::Relaxed),
