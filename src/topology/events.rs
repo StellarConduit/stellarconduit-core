@@ -19,6 +19,37 @@ pub enum TopologyEvent {
         previous: usize,
         current: usize,
     },
+    PeerDisconnected {
+        peer_pubkey: [u8; 32],
+    },
+    RelayLost {
+        relay_pubkey: [u8; 32],
+    },
+    PeerUnreachable {
+        peer_pubkey: [u8; 32],
+    },
+    ClusterMerge {
+        origin_pubkey: [u8; 32],
+    },
+    PartitionDetected {
+        origin_pubkey: [u8; 32],
+    },
+}
+
+impl TopologyEvent {
+    pub fn affected_peer_pubkey(&self) -> [u8; 32] {
+        match self {
+            TopologyEvent::PeerDisconnected { peer_pubkey } => *peer_pubkey,
+            TopologyEvent::RelayLost { relay_pubkey } => *relay_pubkey,
+            TopologyEvent::PeerUnreachable { peer_pubkey } => *peer_pubkey,
+            TopologyEvent::ClusterMerge { origin_pubkey } => *origin_pubkey,
+            TopologyEvent::PartitionDetected { origin_pubkey } => *origin_pubkey,
+            TopologyEvent::PeerUpdated { pubkey, .. } => *pubkey,
+            TopologyEvent::PeerPruned { pubkey } => *pubkey,
+            TopologyEvent::RelayReachabilityGained { via_peer, .. } => *via_peer,
+            _ => [0u8; 32],
+        }
+    }
 }
 
 #[derive(Clone)]
