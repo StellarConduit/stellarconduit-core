@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Origin: {:?}", hex::encode(&envelope.origin_pubkey[..8]));
     println!("Timestamp: {}", envelope.timestamp);
 
-    match relay.process_envelope(&envelope).await {
+    match relay.process_envelope(&envelope, None).await {
         Ok(proof) => {
             println!("✓ Transaction submitted successfully!");
             println!("Proof sequence: {}", proof.sequence);

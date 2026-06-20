@@ -85,7 +85,9 @@ async fn test_process_envelope_success() {
         Metrics::new(),
     );
 
-    let result = relay.process_envelope(&create_envelope([2u8; 32])).await;
+    let result = relay
+        .process_envelope(&create_envelope([2u8; 32]), None)
+        .await;
 
     assert!(result.is_ok());
     let proof = result.unwrap();
@@ -102,7 +104,9 @@ async fn test_process_envelope_rpc_failure() {
         relay_signing_key(),
         Metrics::new(),
     );
-    let result = relay.process_envelope(&create_envelope([2u8; 32])).await;
+    let result = relay
+        .process_envelope(&create_envelope([2u8; 32]), None)
+        .await;
     assert!(result.is_err());
 }
 
@@ -119,8 +123,8 @@ async fn test_process_envelope_deduplicates() {
     );
     let envelope = create_envelope([2u8; 32]);
 
-    let proof1 = relay.process_envelope(&envelope).await.unwrap();
-    let proof2 = relay.process_envelope(&envelope).await.unwrap();
+    let proof1 = relay.process_envelope(&envelope, None).await.unwrap();
+    let proof2 = relay.process_envelope(&envelope, None).await.unwrap();
 
     assert_eq!(proof1, proof2);
     assert!(proof1.verify(&verifying_key, &tx_id));

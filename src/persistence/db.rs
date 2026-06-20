@@ -534,6 +534,24 @@ impl MeshDatabase {
     }
 }
 
+#[cfg(test)]
+mod reputation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_reputation_persisted_and_loaded() {
+        let db = MeshDatabase::init(":memory:").await.unwrap();
+        let mut peer = Peer::new([0xAAu8; 32]);
+        peer.reputation = 73;
+
+        db.save_peer(&peer).await.unwrap();
+
+        let peers = db.load_all_peers().await.unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].reputation, 73);
+    }
+}
+
 fn vec_to_array<const N: usize>(bytes: Vec<u8>, label: &str) -> Result<[u8; N], DbError> {
     bytes.try_into().map_err(|bytes: Vec<u8>| {
         DbError::InvalidRelayProof(format!("{label} must be {N} bytes, got {}", bytes.len()))

@@ -18,6 +18,7 @@ use crate::message::signing::verify_signature;
 use crate::message::types::{ProtocolMessage, SyncRequest, SyncResponse, TransactionEnvelope};
 use crate::metrics::Metrics;
 use crate::peer::identity::PeerIdentity;
+use crate::peer::reputation::{apply_penalty, PenaltyReason};
 use crate::persistence::db::MeshDatabase;
 use crate::topology::events::TopologyEventBus;
 use crate::transport::unified::TransportManager;
@@ -132,11 +133,25 @@ pub async fn process_transaction_envelope(
             Ok(())
         }
         Ok(false) => {
-            let peer = PeerIdentity::new(envelope.origin_pubkey);
-            Err(GossipError::InvalidSignature { peer })
+            let peer_identity = PeerIdentity::new(envelope.origin_pubkey);
+            {
+                let mut pl = peer_list.lock().await;
+                if let Some(peer) = pl.get_peer_mut(&peer_identity.pubkey) {
+                    apply_penalty(peer, PenaltyReason::InvalidSignature);
+                }
+            }
+            Err(GossipError::InvalidSignature {
+                peer: peer_identity,
+            })
         }
         Err(_) => {
             let peer_identity = PeerIdentity::new(envelope.origin_pubkey);
+            {
+                let mut pl = peer_list.lock().await;
+                if let Some(peer) = pl.get_peer_mut(&peer_identity.pubkey) {
+                    apply_penalty(peer, PenaltyReason::InvalidSignature);
+                }
+            }
             let should_ban = strike_tracker.record_failure(&peer_identity);
             if should_ban {
                 const BAN_DURATION_SEC: u64 = 24 * 60 * 60;
@@ -223,6 +238,7 @@ pub async fn execute_fanout_round(
 
     // 4. For each envelope, apply bloom dedup + TTL, then send to recipients.
     let mut forwarded = 0u64;
+    let mut duplicate_origins: Vec<[u8; 32]> = Vec::new();
     let mut transport = transport_manager.lock().await;
 
     for env in batch {
@@ -231,6 +247,7 @@ pub async fn execute_fanout_round(
             metrics
                 .envelopes_dropped_bloom
                 .fetch_add(1, Ordering::Relaxed);
+            duplicate_origins.push(env.origin_pubkey);
             continue;
         }
 
@@ -260,6 +277,15 @@ pub async fn execute_fanout_round(
     }
 
     drop(transport);
+
+    if !duplicate_origins.is_empty() {
+        let mut pl = peer_list.lock().await;
+        for origin in duplicate_origins {
+            if let Some(peer) = pl.get_peer_mut(&origin) {
+                apply_penalty(peer, PenaltyReason::DuplicateMessageFlood);
+            }
+        }
+    }
 
     let rounds = metrics.gossip_rounds_fired.fetch_add(1, Ordering::Relaxed) + 1;
     metrics
@@ -836,6 +862,50 @@ mod tests {
         .await;
 
         assert_eq!(metrics.envelopes_forwarded.load(Ordering::Relaxed), 5);
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_flood_penalizes_peer() {
+        let fanout_calc = FanoutCalculator::new();
+        let mut bloom = SlidingBloomFilter::new(10_000, 0.01);
+        let metrics = Metrics::new();
+
+        let peer_pubkey = [0x42u8; 32];
+        let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
+        {
+            let mut pl = peer_list.lock().await;
+            pl.insert_or_update(peer_pubkey, 80);
+            if let Some(p) = pl.get_peer_mut(&peer_pubkey) {
+                p.reputation = 50;
+            }
+        }
+
+        let state = Arc::new(Mutex::new(GossipState::new()));
+        {
+            let mut st = state.lock().await;
+            let mut env = mock_envelope(0x42);
+            env.origin_pubkey = peer_pubkey;
+            env.ttl_hops = 5;
+            st.add_envelope(env).unwrap();
+        }
+
+        // Pre-seed bloom so the envelope is already "seen" — next check is a duplicate.
+        bloom.check_and_add(&[0x42u8; 32]);
+
+        let transport_manager = make_transport();
+        execute_fanout_round(
+            &mut bloom,
+            &metrics,
+            &state,
+            &peer_list,
+            &transport_manager,
+            &fanout_calc,
+        )
+        .await;
+
+        let pl = peer_list.lock().await;
+        let peer = pl.get_peer(&peer_pubkey).unwrap();
+        assert_eq!(peer.reputation, 40); // 50 - 10 (DuplicateMessageFlood)
     }
 
     #[tokio::test]
