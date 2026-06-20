@@ -1,6 +1,7 @@
 //! Gossip protocol event loop and anti-entropy sync.
 
 use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -15,6 +16,7 @@ use crate::gossip::round::{GossipScheduler, ACTIVE_ROUND_INTERVAL_MS, IDLE_ROUND
 use crate::gossip::strike_tracker::StrikeTracker;
 use crate::message::signing::verify_signature;
 use crate::message::types::{ProtocolMessage, SyncRequest, SyncResponse, TransactionEnvelope};
+use crate::metrics::Metrics;
 use crate::peer::identity::PeerIdentity;
 use crate::persistence::db::MeshDatabase;
 use crate::topology::events::TopologyEventBus;
@@ -114,13 +116,6 @@ impl GossipState {
     }
 }
 
-/// Tracks cumulative gossip loop statistics.
-#[derive(Default, Debug)]
-pub struct GossipLoopMetrics {
-    pub rounds_fired: u64,
-    pub envelopes_forwarded: u64,
-}
-
 /// Process an incoming TransactionEnvelope, verifying its signature and tracking failures.
 pub async fn process_transaction_envelope(
     envelope: &TransactionEnvelope,
@@ -128,6 +123,7 @@ pub async fn process_transaction_envelope(
     peer_list: Arc<Mutex<PeerList>>,
     transport_manager: Arc<Mutex<TransportManager>>,
     db: Option<Arc<MeshDatabase>>,
+    metrics: &Arc<Metrics>,
 ) -> Result<(), GossipError> {
     match verify_signature(envelope) {
         Ok(true) => {
@@ -152,6 +148,7 @@ pub async fn process_transaction_envelope(
                     "repeated invalid signatures",
                 )
                 .await;
+                metrics.peers_banned.fetch_add(1, Ordering::Relaxed);
                 let mut transport_guard = transport_manager.lock().await;
                 transport_guard.disconnect_peer(&peer_identity.pubkey).await;
                 drop(transport_guard);
@@ -179,7 +176,7 @@ pub async fn process_transaction_envelope(
 /// applies bloom deduplication and TTL enforcement, then dispatches to each peer.
 pub async fn execute_fanout_round(
     bloom: &mut SlidingBloomFilter,
-    metrics: &mut GossipLoopMetrics,
+    metrics: &Arc<Metrics>,
     state: &Arc<Mutex<GossipState>>,
     peer_list: &Arc<Mutex<PeerList>>,
     transport_manager: &Arc<Mutex<TransportManager>>,
@@ -196,7 +193,10 @@ pub async fn execute_fanout_round(
     };
 
     if active_peers.is_empty() {
-        metrics.rounds_fired += 1;
+        let rounds = metrics.gossip_rounds_fired.fetch_add(1, Ordering::Relaxed) + 1;
+        if rounds.is_multiple_of(100) {
+            metrics.log_summary();
+        }
         return;
     }
 
@@ -228,12 +228,18 @@ pub async fn execute_fanout_round(
     for env in batch {
         // Bloom deduplication: skip if already seen.
         if bloom.check_and_add(&env.message_id) {
+            metrics
+                .envelopes_dropped_bloom
+                .fetch_add(1, Ordering::Relaxed);
             continue;
         }
 
         // TTL enforcement: drop if expired.
         if env.ttl_hops == 0 {
             log::trace!("Dropping envelope {:?} — TTL exhausted", env.message_id);
+            metrics
+                .envelopes_dropped_ttl
+                .fetch_add(1, Ordering::Relaxed);
             continue;
         }
 
@@ -255,30 +261,29 @@ pub async fn execute_fanout_round(
 
     drop(transport);
 
-    metrics.rounds_fired += 1;
-    metrics.envelopes_forwarded += forwarded;
+    let rounds = metrics.gossip_rounds_fired.fetch_add(1, Ordering::Relaxed) + 1;
+    metrics
+        .envelopes_forwarded
+        .fetch_add(forwarded, Ordering::Relaxed);
 
-    if metrics.rounds_fired.is_multiple_of(100) {
-        log::info!(
-            "GossipLoopMetrics: rounds_fired={}, envelopes_forwarded={}",
-            metrics.rounds_fired,
-            metrics.envelopes_forwarded
-        );
+    if rounds.is_multiple_of(100) {
+        metrics.log_summary();
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_gossip_loop(
     mut scheduler: GossipScheduler,
     mut strike_tracker: StrikeTracker,
     state: Arc<Mutex<GossipState>>,
     peer_list: Arc<Mutex<PeerList>>,
     transport_manager: Arc<Mutex<TransportManager>>,
+    metrics: Arc<Metrics>,
     event_bus: Option<TopologyEventBus>,
     db: Option<Arc<MeshDatabase>>,
 ) {
     let fanout_calc = FanoutCalculator::new();
     let mut bloom = SlidingBloomFilter::new(10_000, 0.01);
-    let mut metrics = GossipLoopMetrics::default();
     let mut anti_entropy_timer = tokio::time::interval(Duration::from_secs(30));
     let mut ban_check_timer = tokio::time::interval(Duration::from_secs(60));
 
@@ -297,7 +302,7 @@ pub async fn run_gossip_loop(
                 if scheduler.is_time_for_round() {
                     execute_fanout_round(
                         &mut bloom,
-                        &mut metrics,
+                        &metrics,
                         &state,
                         &peer_list,
                         &transport_manager,
@@ -341,6 +346,7 @@ pub async fn run_gossip_loop(
 
                     match send_result {
                         Ok(()) => {
+                            metrics.sync_requests_sent.fetch_add(1, Ordering::Relaxed);
                             log::debug!("Anti-entropy SyncRequest sent to {}", peer);
                             let response = {
                                 let mut tm = transport_manager.lock().await;
@@ -351,10 +357,16 @@ pub async fn run_gossip_loop(
                             };
                             match response {
                                 Ok(Some((from_peer, ProtocolMessage::SyncResponse(resp)))) if from_peer == peer => {
+                                    let n = resp.missing_envelopes.len();
+                                    metrics.sync_responses_received.fetch_add(1, Ordering::Relaxed);
+                                    metrics.envelopes_merged_from_sync.fetch_add(n as u64, Ordering::Relaxed);
+                                    if n > MACRO_MERGE_THRESHOLD {
+                                        metrics.macro_merge_events.fetch_add(1, Ordering::Relaxed);
+                                    }
                                     log::debug!(
                                         "Anti-entropy SyncResponse from {}: {} envelope(s)",
                                         peer,
-                                        resp.missing_envelopes.len()
+                                        n
                                     );
                                     let mut st = state.lock().await;
                                     st.handle_sync_response(resp);
@@ -380,6 +392,9 @@ pub async fn run_gossip_loop(
                     peer_list_guard.check_ban_expirations()
                 };
                 if !unbanned.is_empty() {
+                    metrics
+                        .peers_unbanned
+                        .fetch_add(unbanned.len() as u64, Ordering::Relaxed);
                     log::info!("Unbanned {} peer(s) after expiration", unbanned.len());
                     for peer in &unbanned {
                         strike_tracker.clear_peer(peer);
@@ -412,6 +427,7 @@ pub async fn run_gossip_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -491,12 +507,14 @@ mod tests {
         let state = Arc::new(Mutex::new(GossipState::new()));
         let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
         let transport_manager = make_transport();
+        let metrics = Metrics::new();
         let handle = tokio::spawn(run_gossip_loop(
             scheduler,
             strike_tracker,
             state,
             peer_list,
             transport_manager,
+            metrics,
             None,
             None,
         ));
@@ -515,12 +533,14 @@ mod tests {
         let state = Arc::new(Mutex::new(GossipState::new()));
         let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
         let transport_manager = make_transport();
+        let metrics = Metrics::new();
         let handle = tokio::spawn(run_gossip_loop(
             scheduler,
             strike_tracker,
             state,
             peer_list,
             transport_manager,
+            metrics,
             None,
             None,
         ));
@@ -540,12 +560,14 @@ mod tests {
         let state = Arc::new(Mutex::new(GossipState::new()));
         let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
         let transport_manager = make_transport();
+        let metrics = Metrics::new();
         let handle = tokio::spawn(run_gossip_loop(
             scheduler,
             strike_tracker,
             state,
             peer_list,
             transport_manager,
+            metrics,
             None,
             None,
         ));
@@ -589,20 +611,21 @@ mod tests {
 
     #[test]
     fn test_gossip_metrics_accumulate() {
-        let mut metrics = GossipLoopMetrics::default();
-        metrics.rounds_fired += 1;
-        metrics.envelopes_forwarded += 3;
-        metrics.rounds_fired += 1;
-        metrics.envelopes_forwarded += 2;
-        assert_eq!(metrics.rounds_fired, 2);
-        assert_eq!(metrics.envelopes_forwarded, 5);
+        let metrics = Metrics::new();
+        metrics.gossip_rounds_fired.fetch_add(1, Ordering::Relaxed);
+        metrics.envelopes_forwarded.fetch_add(3, Ordering::Relaxed);
+        metrics.gossip_rounds_fired.fetch_add(1, Ordering::Relaxed);
+        metrics.envelopes_forwarded.fetch_add(2, Ordering::Relaxed);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.gossip_rounds_fired, 2);
+        assert_eq!(snap.envelopes_forwarded, 5);
     }
 
     #[tokio::test]
     async fn test_execute_fanout_round_drops_ttl_zero() {
         let fanout_calc = FanoutCalculator::new();
         let mut bloom = SlidingBloomFilter::new(10_000, 0.01);
-        let mut metrics = GossipLoopMetrics::default();
+        let metrics = Metrics::new();
 
         let state = Arc::new(Mutex::new(GossipState::new()));
         {
@@ -621,7 +644,7 @@ mod tests {
 
         execute_fanout_round(
             &mut bloom,
-            &mut metrics,
+            &metrics,
             &state,
             &peer_list,
             &transport_manager,
@@ -629,7 +652,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(metrics.rounds_fired, 1);
+        assert_eq!(metrics.gossip_rounds_fired.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -705,6 +728,7 @@ mod tests {
         let mut strike_tracker = StrikeTracker::new();
         let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
         let transport_manager = make_transport();
+        let metrics = Metrics::new();
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
 
         // The StrikeTracker bans once failures exceed max_strikes (3), i.e. on
@@ -719,11 +743,13 @@ mod tests {
                 peer_list.clone(),
                 transport_manager.clone(),
                 None,
+                &metrics,
             )
             .await;
         }
 
         assert!(matches!(last, Err(GossipError::PeerBanned { .. })));
+        assert_eq!(metrics.peers_banned.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -731,6 +757,7 @@ mod tests {
         let mut strike_tracker = StrikeTracker::new();
         let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
         let transport_manager = make_transport();
+        let metrics = Metrics::new();
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x43; 32]);
 
         let env = signed_envelope(&signing_key, 0x01);
@@ -740,9 +767,112 @@ mod tests {
             peer_list.clone(),
             transport_manager.clone(),
             None,
+            &metrics,
         )
         .await;
 
         assert!(result.is_ok());
+    }
+
+    // ── Issue #100 acceptance criteria: metrics counters ──────────────────────
+
+    #[tokio::test]
+    async fn test_gossip_metrics_rounds_accumulate() {
+        let metrics = Metrics::new();
+        let fanout_calc = FanoutCalculator::new();
+        let mut bloom = SlidingBloomFilter::new(10_000, 0.01);
+        let state = Arc::new(Mutex::new(GossipState::new()));
+        let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
+        let transport_manager = make_transport();
+
+        for _ in 0..3 {
+            execute_fanout_round(
+                &mut bloom,
+                &metrics,
+                &state,
+                &peer_list,
+                &transport_manager,
+                &fanout_calc,
+            )
+            .await;
+        }
+
+        assert_eq!(metrics.gossip_rounds_fired.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_envelopes_forwarded() {
+        let metrics = Metrics::new();
+        let fanout_calc = FanoutCalculator::new();
+        let mut bloom = SlidingBloomFilter::new(10_000, 0.01);
+        let state = Arc::new(Mutex::new(GossipState::new()));
+
+        // 5 unique envelopes with TTL > 0
+        {
+            let mut st = state.lock().await;
+            for i in 0u8..5 {
+                let mut env = mock_envelope(i);
+                env.ttl_hops = 5;
+                st.add_envelope(env).unwrap();
+            }
+        }
+
+        // One active peer so the fanout loop runs (send will fail — still counted as forwarded)
+        let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
+        {
+            let mut pl = peer_list.lock().await;
+            pl.insert_or_update([0xAAu8; 32], 80);
+        }
+        let transport_manager = make_transport();
+
+        execute_fanout_round(
+            &mut bloom,
+            &metrics,
+            &state,
+            &peer_list,
+            &transport_manager,
+            &fanout_calc,
+        )
+        .await;
+
+        assert_eq!(metrics.envelopes_forwarded.load(Ordering::Relaxed), 5);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_envelopes_dropped_ttl() {
+        let metrics = Metrics::new();
+        let fanout_calc = FanoutCalculator::new();
+        let mut bloom = SlidingBloomFilter::new(10_000, 0.01);
+        let state = Arc::new(Mutex::new(GossipState::new()));
+
+        {
+            let mut st = state.lock().await;
+            let mut env_dead = mock_envelope(0xDD);
+            env_dead.ttl_hops = 0;
+            st.add_envelope(env_dead).unwrap();
+
+            let env_live = mock_envelope(0xEE); // ttl_hops = 10 by default
+            st.add_envelope(env_live).unwrap();
+        }
+
+        // One active peer so the TTL check actually runs
+        let peer_list = Arc::new(Mutex::new(PeerList::new(300)));
+        {
+            let mut pl = peer_list.lock().await;
+            pl.insert_or_update([0xBBu8; 32], 80);
+        }
+        let transport_manager = make_transport();
+
+        execute_fanout_round(
+            &mut bloom,
+            &metrics,
+            &state,
+            &peer_list,
+            &transport_manager,
+            &fanout_calc,
+        )
+        .await;
+
+        assert_eq!(metrics.envelopes_dropped_ttl.load(Ordering::Relaxed), 1);
     }
 }
