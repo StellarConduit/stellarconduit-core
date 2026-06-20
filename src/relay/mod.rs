@@ -1,12 +1,16 @@
 pub mod dedup;
 pub mod rpc_client;
 
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use log::info;
 
 use crate::message::relay_proof::RelayChainProof;
 use crate::message::types::TransactionEnvelope;
+use crate::metrics::Metrics;
 use crate::relay::dedup::RelayDeduplicator;
 
 /// Errors returned by the Stellar RPC layer.
@@ -36,6 +40,7 @@ pub struct RelayNode {
     deduplicator: RelayDeduplicator,
     rpc_client: Box<dyn StellarRpcClient>,
     signing_key: SigningKey,
+    metrics: Arc<Metrics>,
 }
 
 impl RelayNode {
@@ -43,11 +48,13 @@ impl RelayNode {
         capacity: usize,
         rpc_client: Box<dyn StellarRpcClient>,
         signing_key: SigningKey,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             deduplicator: RelayDeduplicator::new(capacity),
             rpc_client,
             signing_key,
+            metrics,
         }
     }
 
@@ -64,7 +71,22 @@ impl RelayNode {
             return Ok(existing_proof);
         }
 
-        let tx_hash = self.rpc_client.submit_transaction(&envelope.tx_xdr).await?;
+        let tx_hash = match self.rpc_client.submit_transaction(&envelope.tx_xdr).await {
+            Ok(h) => {
+                self.metrics
+                    .transactions_submitted
+                    .fetch_add(1, Ordering::Relaxed);
+                h
+            }
+            Err(RpcError::TransactionRejected { reason }) => {
+                self.metrics
+                    .transactions_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(RpcError::TransactionRejected { reason });
+            }
+            Err(e) => return Err(e),
+        };
+
         let tx_id = decode_hash_32(&tx_hash, "transaction hash").map_err(RpcError::Network)?;
         let sequence = self.rpc_client.get_ledger_sequence().await?;
         let chain_hash_str = self.rpc_client.get_ledger_hash().await?;
@@ -151,6 +173,7 @@ mod tests {
             1000,
             Box::new(make_client(submit_count.clone())),
             signing_key,
+            Metrics::new(),
         );
         let envelope = create_test_envelope([1u8; 32]);
 
@@ -170,6 +193,7 @@ mod tests {
             1000,
             Box::new(make_client(submit_count.clone())),
             create_signing_key(),
+            Metrics::new(),
         );
         let envelope = create_test_envelope([1u8; 32]);
 
@@ -189,6 +213,7 @@ mod tests {
             1000,
             Box::new(make_client(submit_count.clone())),
             create_signing_key(),
+            Metrics::new(),
         );
 
         relay
@@ -201,5 +226,66 @@ mod tests {
             .unwrap();
 
         assert_eq!(submit_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_relay_metrics_transactions_submitted() {
+        let submit_count = Arc::new(AtomicUsize::new(0));
+        let metrics = Metrics::new();
+        let mut relay = RelayNode::new(
+            1000,
+            Box::new(make_client(submit_count.clone())),
+            create_signing_key(),
+            metrics.clone(),
+        );
+
+        relay
+            .process_envelope(&create_test_envelope([1u8; 32]))
+            .await
+            .unwrap();
+        relay
+            .process_envelope(&create_test_envelope([2u8; 32]))
+            .await
+            .unwrap();
+
+        assert_eq!(metrics.transactions_submitted.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_relay_metrics_transactions_rejected() {
+        struct RejectingClient;
+
+        #[async_trait]
+        impl StellarRpcClient for RejectingClient {
+            async fn submit_transaction(&self, _: &str) -> Result<String, RpcError> {
+                Err(RpcError::TransactionRejected {
+                    reason: "test".to_string(),
+                })
+            }
+            async fn get_account_sequence(&self, _: &str) -> Result<u64, RpcError> {
+                Ok(0)
+            }
+            async fn get_ledger_sequence(&self) -> Result<u64, RpcError> {
+                Ok(0)
+            }
+            async fn get_ledger_hash(&self) -> Result<String, RpcError> {
+                Ok(String::new())
+            }
+        }
+
+        let metrics = Metrics::new();
+        let mut relay = RelayNode::new(
+            1000,
+            Box::new(RejectingClient),
+            create_signing_key(),
+            metrics.clone(),
+        );
+
+        let result = relay
+            .process_envelope(&create_test_envelope([3u8; 32]))
+            .await;
+        assert!(matches!(result, Err(RpcError::TransactionRejected { .. })));
+        assert_eq!(metrics.transactions_rejected.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.transactions_submitted.load(Ordering::Relaxed), 0);
     }
 }

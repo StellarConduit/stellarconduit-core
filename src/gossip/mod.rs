@@ -7,4 +7,3 @@ pub mod round;
 pub mod strike_tracker;
 
 pub use errors::GossipError;
-pub use protocol::GossipLoopMetrics;
