@@ -1,5 +1,6 @@
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::time::timeout;
 
 use stellarconduit_core::gossip::protocol::GossipState;
 use stellarconduit_core::message::types::{ProtocolMessage, TransactionEnvelope};
@@ -7,6 +8,18 @@ use stellarconduit_core::peer::identity::PeerIdentity;
 use stellarconduit_core::transport::connection::Connection;
 use stellarconduit_core::transport::unified::{TransportManager, TransportPreference};
 use stellarconduit_core::transport::wifi_transport::WifiDirectConnection;
+
+async fn send_with_timeout<F, T, E>(fut: F, ms: u64, ctx: &str) -> T
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Debug,
+{
+    match timeout(Duration::from_millis(ms), fut).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => panic!("{} send failed: {:?}", ctx, e),
+        Err(_) => panic!("{} send timed out after {}ms", ctx, ms),
+    }
+}
 
 fn mock_envelope(id_byte: u8, origin: [u8; 32], ttl: u8) -> TransactionEnvelope {
     TransactionEnvelope {
@@ -51,7 +64,7 @@ async fn test_full_gossip_round_delivers_to_peer() {
 
     let batch = state_a.active_queue.drain_batch(32);
     for msg in batch {
-        mgr_a.send_to(&peer_b, msg).await.unwrap();
+        send_with_timeout(mgr_a.send_to(&peer_b, msg), 5000, "mgr_a.send_to(&peer_b)").await;
     }
 
     let mut conn_b = b_conn_task.await.unwrap();
@@ -98,10 +111,12 @@ async fn test_anti_entropy_sync_converges_two_nodes() {
     state_b.add_envelope(env_b1).unwrap();
 
     let req = state_b.generate_sync_request();
-    conn_b_to_a
-        .send(ProtocolMessage::SyncRequest(req))
-        .await
-        .unwrap();
+    send_with_timeout(
+        conn_b_to_a.send(ProtocolMessage::SyncRequest(req)),
+        5000,
+        "conn_b_to_a.send(SyncRequest)",
+    )
+    .await;
 
     let received = conn_a_to_b.recv().await.unwrap();
     let ProtocolMessage::SyncRequest(req) = received else {
@@ -111,10 +126,12 @@ async fn test_anti_entropy_sync_converges_two_nodes() {
     let resp = state_a.handle_sync_request(&req);
     assert_eq!(resp.missing_envelopes.len(), 2);
 
-    conn_a_to_b
-        .send(ProtocolMessage::SyncResponse(resp))
-        .await
-        .unwrap();
+    send_with_timeout(
+        conn_a_to_b.send(ProtocolMessage::SyncResponse(resp)),
+        5000,
+        "conn_a_to_b.send(SyncResponse)",
+    )
+    .await;
 
     let received = conn_b_to_a.recv().await.unwrap();
     let ProtocolMessage::SyncResponse(resp) = received else {
@@ -178,10 +195,12 @@ async fn test_ttl_decrement_prevents_infinite_loops() {
             continue;
         };
         env.ttl_hops = env.ttl_hops.saturating_sub(1);
-        mgr_a
-            .send_to(&peer_b, ProtocolMessage::Transaction(env))
-            .await
-            .unwrap();
+        send_with_timeout(
+            mgr_a.send_to(&peer_b, ProtocolMessage::Transaction(env)),
+            5000,
+            "mgr_a.send_to(&peer_b) (TTL test)",
+        )
+        .await;
     }
 
     let received = b_conn.recv().await.unwrap();
@@ -270,13 +289,13 @@ async fn test_concurrent_gossip_does_not_deadlock() {
 
     let task_a = tokio::spawn(async move {
         for _ in 0..100 {
-            conn_a_to_b.send(msg.clone()).await.unwrap();
+            send_with_timeout(conn_a_to_b.send(msg.clone()), 5000, "conn_a_to_b.send (concurrent)").await;
         }
     });
 
     let task_b = tokio::spawn(async move {
         for _ in 0..100 {
-            conn_b_to_a.send(msg_b.clone()).await.unwrap();
+            send_with_timeout(conn_b_to_a.send(msg_b.clone()), 5000, "conn_b_to_a.send (concurrent)").await;
         }
     });
 
