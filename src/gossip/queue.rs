@@ -29,6 +29,10 @@ impl MessagePriority {
                 MessagePriority::High
             }
             ProtocolMessage::Transaction(_) => MessagePriority::Normal,
+            // Handshake messages are only used at the transport layer during
+            // BLE connection setup and are not gossiped. Assign Low so they
+            // never block protocol messages in the queue.
+            ProtocolMessage::Handshake { .. } => MessagePriority::Low,
         }
     }
 

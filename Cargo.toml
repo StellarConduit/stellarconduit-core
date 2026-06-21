@@ -5,6 +5,10 @@ edition = "2021"
 description = "Core mesh networking and gossip protocol for StellarConduit"
 license = "Apache-2.0"
 
+[features]
+default = []
+ble = []
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
