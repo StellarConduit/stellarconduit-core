@@ -1168,11 +1168,7 @@ mod tests {
         let chunker = MessageChunker { mtu: 4096 };
         for frame in chunker.chunk(&bytes) {
             let raw = crate::transport::ble_transport::encode_chunk(&frame);
-            mgr.ble_inject()
-                .unwrap()
-                .send(raw)
-                .await
-                .unwrap();
+            mgr.ble_inject().unwrap().send(raw).await.unwrap();
         }
 
         // Give the listener time to process and register.
@@ -1205,11 +1201,7 @@ mod tests {
         let chunker = MessageChunker { mtu: 4096 };
         for frame in chunker.chunk(&bytes) {
             let raw = crate::transport::ble_transport::encode_chunk(&frame);
-            mgr.ble_inject()
-                .unwrap()
-                .send(raw)
-                .await
-                .unwrap();
+            mgr.ble_inject().unwrap().send(raw).await.unwrap();
         }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1242,11 +1234,7 @@ mod tests {
         let chunker = MessageChunker { mtu: 4096 };
         for frame in chunker.chunk(&bytes) {
             let raw = crate::transport::ble_transport::encode_chunk(&frame);
-            mgr.ble_inject()
-                .unwrap()
-                .send(raw)
-                .await
-                .unwrap();
+            mgr.ble_inject().unwrap().send(raw).await.unwrap();
         }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
