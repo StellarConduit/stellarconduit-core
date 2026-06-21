@@ -37,6 +37,10 @@ pub enum GossipError {
     /// A serialization or deserialization error in the gossip codec.
     #[error("codec error: {0}")]
     CodecError(String),
+
+    /// Envelope TTL reached zero and cannot be forwarded further.
+    #[error("envelope TTL expired, cannot forward")]
+    TtlExpired,
 }
 
 #[cfg(test)]

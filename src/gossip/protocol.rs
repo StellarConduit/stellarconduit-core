@@ -129,6 +129,11 @@ pub async fn process_transaction_envelope(
     transport_manager: Arc<Mutex<TransportManager>>,
     db: Option<Arc<MeshDatabase>>,
 ) -> Result<(), GossipError> {
+    // TTL enforcement: reject expired envelopes
+    if envelope.ttl_hops == 0 {
+        return Err(GossipError::TtlExpired);
+    }
+
     match verify_signature(envelope) {
         Ok(true) => {
             let peer_identity = PeerIdentity::new(envelope.origin_pubkey);
