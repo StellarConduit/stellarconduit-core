@@ -7,10 +7,23 @@
 //! Unit tests cover state-machine and chunking logic only; BLE integration tests need a real adapter.
 
 use async_trait::async_trait;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+/// Test-only: number of consecutive times `BlePeripheral::start_advertising`
+/// should fail before succeeding.
+#[cfg(test)]
+static ADVERTISE_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Set the number of times `start_advertising` should fail (for testing retry logic).
+#[cfg(test)]
+pub fn set_advertise_fail_count(n: usize) {
+    ADVERTISE_FAIL_COUNT.store(n, Ordering::SeqCst);
+}
 
 use crate::message::types::ProtocolMessage;
 use crate::peer::identity::PeerIdentity;
@@ -117,6 +130,14 @@ impl BlePeripheral {
     ///
     /// Returns `Err(TransportError::ConnectionRefused)` if no BLE adapter is available.
     pub async fn start_advertising(&mut self) -> Result<(), TransportError> {
+        #[cfg(test)]
+        {
+            let prev = ADVERTISE_FAIL_COUNT.load(Ordering::SeqCst);
+            if prev > 0 {
+                ADVERTISE_FAIL_COUNT.store(prev - 1, Ordering::SeqCst);
+                return Err(TransportError::ConnectionRefused);
+            }
+        }
         // Platform integration: btleplug adapter acquisition would happen here.
         // For now we transition state to Connected to allow unit-testable logic.
         self.state = ConnectionState::Connected;
@@ -206,6 +227,7 @@ impl Connection for BlePeripheral {
 pub struct BleCentral {
     state: ConnectionState,
     remote_peer: PeerIdentity,
+    local_peer: PeerIdentity,
     chunker: MessageChunker,
     inbox_tx: mpsc::Sender<Vec<u8>>,
     inbox_rx: mpsc::Receiver<Vec<u8>>,
@@ -219,10 +241,17 @@ impl BleCentral {
         Self {
             state: ConnectionState::Disconnected,
             remote_peer,
+            local_peer: PeerIdentity::new([0u8; 32]),
             chunker: MessageChunker { mtu: BLE_ATT_MTU },
             inbox_tx: tx,
             inbox_rx: rx,
         }
+    }
+
+    /// Set the local peer identity so the Handshake is sent with the correct pubkey.
+    pub fn with_local_peer(mut self, local: PeerIdentity) -> Self {
+        self.local_peer = local;
+        self
     }
 
     /// Scan for BLE peripherals advertising `SC_SERVICE_UUID` and connect to the one
@@ -235,11 +264,25 @@ impl BleCentral {
     /// 4. Connect to the matching peripheral, discover characteristics.
     /// 5. Subscribe to the Notify Characteristic, spawning a task that feeds inbound frames
     ///    to the inbox channel via `decode_chunk` / `MessageReassembler`.
+    /// 6. Send a `ProtocolMessage::Handshake` as the first message.
     ///
     /// Returns `Err(TransportError::ConnectionRefused)` if the target cannot be found.
     pub async fn scan_and_connect(&mut self) -> Result<(), TransportError> {
         // Platform integration: btleplug scan + connect would happen here.
         self.state = ConnectionState::Connected;
+
+        // Send Handshake as the first message after connecting.
+        let handshake = ProtocolMessage::Handshake {
+            pubkey: self.local_peer.pubkey,
+        };
+        let bytes = rmp_serde::to_vec(&handshake).map_err(|_| TransportError::BrokenPipe)?;
+        let frames = self.chunker.chunk(&bytes);
+        for frame in frames {
+            let _encoded = encode_chunk(&frame);
+            // Platform integration: write `_encoded` to the remote Peripheral's
+            // Write Characteristic via the btleplug central handle.
+        }
+
         Ok(())
     }
 

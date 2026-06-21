@@ -116,6 +116,10 @@ pub enum ProtocolMessage {
 
     /// A response containing missing messages requested via SyncRequest
     SyncResponse(SyncResponse),
+
+    /// BLE peer identity handshake — the first message a Central sends after
+    /// connecting to a Peripheral, containing the Central's public key.
+    Handshake { pubkey: [u8; 32] },
 }
 
 impl ProtocolMessage {

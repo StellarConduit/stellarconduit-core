@@ -175,6 +175,8 @@ use tokio::sync::{mpsc, watch};
 use crate::message::types::ProtocolMessage;
 use crate::peer::identity::PeerIdentity;
 use crate::transport::ble_transport::BleCentral;
+#[cfg(feature = "ble")]
+use crate::transport::ble_transport::{BlePeripheral, decode_chunk};
 use crate::transport::connection::Connection;
 use crate::transport::errors::TransportError;
 use crate::transport::power::{InterfacePowerState, PowerManager};
@@ -207,6 +209,16 @@ pub struct TransportManager {
     peer_count: Arc<AtomicUsize>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
+    /// Sender for injecting raw characteristic write data into the BLE listener.
+    /// Used in tests to simulate peripheral data reception.
+    #[cfg(feature = "ble")]
+    ble_inject_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// Receiver for inbound BLE connections that have completed the handshake.
+    #[cfg(feature = "ble")]
+    ble_conn_rx: Option<mpsc::Receiver<(PeerIdentity, Box<dyn Connection>)>>,
+    /// Delay between BLE advertising retry attempts when advertising fails.
+    #[cfg(feature = "ble")]
+    ble_advertise_retry_delay: Duration,
 }
 
 impl TransportManager {
@@ -228,6 +240,12 @@ impl TransportManager {
             peer_count: Arc::new(AtomicUsize::new(0)),
             shutdown_tx,
             shutdown_rx,
+            #[cfg(feature = "ble")]
+            ble_inject_tx: None,
+            #[cfg(feature = "ble")]
+            ble_conn_rx: None,
+            #[cfg(feature = "ble")]
+            ble_advertise_retry_delay: Duration::from_secs(30),
         }
     }
 
@@ -465,6 +483,103 @@ impl TransportManager {
         Ok(bound_addr)
     }
 
+    /// Start accepting inbound BLE connections from Central devices.
+    ///
+    /// This method starts a background task that:
+    /// 1. Instantiates a `BlePeripheral` and calls `start_advertising()`.
+    /// 2. Waits for a Central to connect and send a `ProtocolMessage::Handshake`.
+    /// 3. Registers the connection in `self.connections` keyed by the Central's pubkey.
+    /// 4. Loops to accept the next inbound connection.
+    ///
+    /// Returns immediately after spawning the accept task.
+    #[cfg(feature = "ble")]
+    pub async fn start_ble_listener(
+        &mut self,
+        local_peer: PeerIdentity,
+    ) -> Result<(), TransportError> {
+        let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (conn_tx, conn_rx) = mpsc::channel::<(PeerIdentity, Box<dyn Connection>)>(64);
+
+        self.ble_inject_tx = Some(data_tx);
+        self.ble_conn_rx = Some(conn_rx);
+
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        let peer_count = Arc::clone(&self.peer_count);
+        let max_peers = self.max_peers;
+        let retry_delay = self.ble_advertise_retry_delay;
+
+        tokio::spawn(async move {
+            'outer: loop {
+                // Retry advertising on failure with configurable delay.
+                loop {
+                    let mut peripheral = BlePeripheral::new(local_peer.clone());
+                    match peripheral.start_advertising().await {
+                        Ok(()) => break,
+                        Err(e) => {
+                            log::error!(
+                                "BLE advertising failed: {e:?}; retrying in ~{delay}s",
+                                delay = retry_delay.as_secs(),
+                            );
+                            tokio::time::sleep(retry_delay).await;
+                        }
+                    }
+                }
+
+                // Accept loop — reassemble one connection at a time.
+                let mut reassembler = MessageReassembler::new();
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_rx.changed() => break 'outer,
+                        data = data_rx.recv() => {
+                            match data {
+                                Some(bytes) => {
+                                    if peer_count.load(Ordering::SeqCst) >= max_peers {
+                                        log::warn!(
+                                            "max_peers ({max_peers}) reached, dropping inbound BLE"
+                                        );
+                                        continue;
+                                    }
+
+                                    // Decode chunk frame and try to complete a message.
+                                    let Some(frame) = decode_chunk(&bytes) else {
+                                        continue;
+                                    };
+                                    let Some(complete) = reassembler.receive_chunk(frame)
+                                        else {
+                                        continue;
+                                    };
+
+                                    match ProtocolMessage::from_bytes(&complete) {
+                                        Ok(ProtocolMessage::Handshake { pubkey }) => {
+                                            let central_peer = PeerIdentity::new(pubkey);
+                                            let conn: Box<dyn Connection> =
+                                                Box::new(BlePeripheral::new(central_peer.clone()));
+                                            let _ = conn_tx.send((central_peer, conn)).await;
+                                            // Reset for next connection.
+                                            reassembler = MessageReassembler::new();
+                                        }
+                                        _ => {
+                                            log::warn!(
+                                                "First BLE message was not a Handshake; \
+                                                 dropping connection"
+                                            );
+                                            reassembler = MessageReassembler::new();
+                                        }
+                                    }
+                                }
+                                None => break 'outer,
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
     /// Register an inbound connection accepted externally (e.g. from the gossip loop).
     ///
     /// Inserts `conn` into `active_connections` keyed by `peer.pubkey`, replacing
@@ -476,6 +591,35 @@ impl TransportManager {
         }
     }
 
+    /// Drain the BLE listener's completed-handshake channel and register any
+    /// ready-to-use connections into `active_connections`.
+    #[cfg(feature = "ble")]
+    fn process_ble_incoming(&mut self) {
+        let mut entries = Vec::new();
+        if let Some(rx) = &mut self.ble_conn_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok((peer, conn)) => entries.push((peer, conn)),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        self.ble_conn_rx = None;
+                        break;
+                    }
+                }
+            }
+        }
+        for (peer, conn) in entries {
+            self.register_inbound(peer, conn);
+        }
+    }
+
+    /// Return a clone of the BLE data injection sender, if the listener is running.
+    /// Used in tests to simulate characteristic writes from a Central.
+    #[cfg(feature = "ble")]
+    pub fn ble_inject(&self) -> Option<mpsc::Sender<Vec<u8>>> {
+        self.ble_inject_tx.clone()
+    }
+
     pub async fn power_tick(&mut self) -> Result<PowerTickOutcome, TransportError> {
         self.power_tick_at(current_unix_duration()).await
     }
@@ -483,6 +627,9 @@ impl TransportManager {
     // ── Internal ─────────────────────────────────────────────────────────────
 
     async fn power_tick_at(&mut self, now: Duration) -> Result<PowerTickOutcome, TransportError> {
+        #[cfg(feature = "ble")]
+        self.process_ble_incoming();
+
         let decision = self.power_manager.tick(now);
         let mut flushed_transactions = 0usize;
 
@@ -997,5 +1144,120 @@ mod tests {
             rx.try_recv().is_err(),
             "connection should have been dropped"
         );
+    }
+
+    // ── BLE listener tests ───────────────────────────────────────────────────
+
+    #[cfg(feature = "ble")]
+    #[tokio::test]
+    async fn test_ble_listener_registers_connection_after_handshake() {
+        let local = peer(0xAA);
+        let central_pubkey = [0xBB; 32];
+        let mut mgr = TransportManager::new(TransportPreference::BleOnly);
+        mgr.ble_advertise_retry_delay = Duration::from_millis(5);
+        mgr.start_ble_listener(local).await.unwrap();
+
+        // Give the listener task time to start advertising.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Inject a Handshake — chunk it like a real BLE characteristic write.
+        let handshake = ProtocolMessage::Handshake {
+            pubkey: central_pubkey,
+        };
+        let bytes = rmp_serde::to_vec(&handshake).unwrap();
+        let chunker = MessageChunker { mtu: 4096 };
+        for frame in chunker.chunk(&bytes) {
+            let raw = crate::transport::ble_transport::encode_chunk(&frame);
+            mgr.ble_inject()
+                .unwrap()
+                .send(raw)
+                .await
+                .unwrap();
+        }
+
+        // Give the listener time to process and register.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // process_ble_incoming is called inside power_tick_at, which recv_any_at
+        // invokes.  Call recv_any once to trigger the drain.
+        let _ = mgr.recv_any_at(Duration::from_secs(0)).await;
+
+        assert!(
+            mgr.active_connections.contains_key(&central_pubkey),
+            "Central's BlePeripheral should have been registered"
+        );
+        assert_eq!(mgr.connection_count(), 1);
+    }
+
+    #[cfg(feature = "ble")]
+    #[tokio::test]
+    async fn test_ble_listener_rejects_non_handshake_first_message() {
+        let local = peer(0xAA);
+        let mut mgr = TransportManager::new(TransportPreference::BleOnly);
+        mgr.ble_advertise_retry_delay = Duration::from_millis(5);
+        mgr.start_ble_listener(local).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Inject a Transaction as the first message (not a Handshake).
+        let tx = sample_transaction(1);
+        let bytes = rmp_serde::to_vec(&tx).unwrap();
+        let chunker = MessageChunker { mtu: 4096 };
+        for frame in chunker.chunk(&bytes) {
+            let raw = crate::transport::ble_transport::encode_chunk(&frame);
+            mgr.ble_inject()
+                .unwrap()
+                .send(raw)
+                .await
+                .unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = mgr.recv_any_at(Duration::from_secs(0)).await;
+
+        // No connection should have been registered.
+        assert_eq!(mgr.connection_count(), 0);
+    }
+
+    #[cfg(feature = "ble")]
+    #[tokio::test]
+    async fn test_ble_listener_retries_on_advertising_failure() {
+        // Make start_advertising fail the first two calls, then succeed.
+        crate::transport::ble_transport::set_advertise_fail_count(2);
+
+        let local = peer(0xAA);
+        let central_pubkey = [0xCC; 32];
+        let mut mgr = TransportManager::new(TransportPreference::BleOnly);
+        mgr.ble_advertise_retry_delay = Duration::from_millis(5);
+        mgr.start_ble_listener(local).await.unwrap();
+
+        // Wait long enough for the two failures + retries + success.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Now inject a Handshake — the listener should be advertising.
+        let handshake = ProtocolMessage::Handshake {
+            pubkey: central_pubkey,
+        };
+        let bytes = rmp_serde::to_vec(&handshake).unwrap();
+        let chunker = MessageChunker { mtu: 4096 };
+        for frame in chunker.chunk(&bytes) {
+            let raw = crate::transport::ble_transport::encode_chunk(&frame);
+            mgr.ble_inject()
+                .unwrap()
+                .send(raw)
+                .await
+                .unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = mgr.recv_any_at(Duration::from_secs(0)).await;
+
+        assert!(
+            mgr.active_connections.contains_key(&central_pubkey),
+            "Connection should be registered after advertising succeeds"
+        );
+
+        // Reset for other tests.
+        crate::transport::ble_transport::set_advertise_fail_count(0);
     }
 }
