@@ -513,7 +513,9 @@ impl TransportManager {
         let retry_delay = self.ble_advertise_retry_delay;
 
         tokio::spawn(async move {
-            'outer: loop {
+            // Labeled block (not a loop): advertise once, then accept connections
+            // until shutdown or the inject channel closes via `break 'outer`.
+            'outer: {
                 // Retry advertising on failure with configurable delay.
                 loop {
                     let mut peripheral = BlePeripheral::new(local_peer.clone());
