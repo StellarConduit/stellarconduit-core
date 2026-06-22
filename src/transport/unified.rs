@@ -176,7 +176,7 @@ use crate::message::types::ProtocolMessage;
 use crate::peer::identity::PeerIdentity;
 use crate::transport::ble_transport::BleCentral;
 #[cfg(feature = "ble")]
-use crate::transport::ble_transport::{BlePeripheral, decode_chunk};
+use crate::transport::ble_transport::{decode_chunk, BlePeripheral};
 use crate::transport::connection::Connection;
 use crate::transport::errors::TransportError;
 use crate::transport::power::{InterfacePowerState, PowerManager};
