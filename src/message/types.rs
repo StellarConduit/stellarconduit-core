@@ -79,6 +79,8 @@ pub enum TopologyFlag {
     LowPowerMode,
     /// Device will enter deep sleep within the next 60s.
     DeepSleepPending,
+    /// BLE Central MAC address has been rotated for privacy.
+    MacRotated,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
