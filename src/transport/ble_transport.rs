@@ -669,7 +669,7 @@ mod tests {
 
     #[test]
     fn test_rotate_mac_returns_none_before_interval() {
-        let c = BleCentral::new(make_peer())
+        let mut c = BleCentral::new(make_peer())
             .with_mac_provider(Box::new(MockMacProvider::new()))
             .with_rotation_interval(Duration::from_secs(60));
 
