@@ -728,4 +728,3 @@ mod tests {
         assert!(mac[0] & 0b00000010 != 0);
     }
 }
-

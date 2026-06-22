@@ -687,7 +687,7 @@ impl TransportManager {
     }
 
     /// Notify all connections that a BLE MAC address rotation has occurred.
-    /// 
+    ///
     /// This method drops all existing BLE connections (as they reference the old MAC).
     /// WiFi-Direct connections are unaffected and persist across the rotation.
     pub async fn notify_mac_rotated(&mut self, new_mac: [u8; 6]) {
