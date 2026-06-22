@@ -289,13 +289,23 @@ async fn test_concurrent_gossip_does_not_deadlock() {
 
     let task_a = tokio::spawn(async move {
         for _ in 0..100 {
-            send_with_timeout(conn_a_to_b.send(msg.clone()), 5000, "conn_a_to_b.send (concurrent)").await;
+            send_with_timeout(
+                conn_a_to_b.send(msg.clone()),
+                5000,
+                "conn_a_to_b.send (concurrent)",
+            )
+            .await;
         }
     });
 
     let task_b = tokio::spawn(async move {
         for _ in 0..100 {
-            send_with_timeout(conn_b_to_a.send(msg_b.clone()), 5000, "conn_b_to_a.send (concurrent)").await;
+            send_with_timeout(
+                conn_b_to_a.send(msg_b.clone()),
+                5000,
+                "conn_b_to_a.send (concurrent)",
+            )
+            .await;
         }
     });
 

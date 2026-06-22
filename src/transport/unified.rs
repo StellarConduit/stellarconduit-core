@@ -176,7 +176,7 @@ use crate::message::types::ProtocolMessage;
 use crate::peer::identity::PeerIdentity;
 use crate::transport::ble_transport::BleCentral;
 #[cfg(feature = "ble")]
-use crate::transport::ble_transport::{BlePeripheral, decode_chunk};
+use crate::transport::ble_transport::{decode_chunk, BlePeripheral};
 use crate::transport::connection::Connection;
 use crate::transport::errors::TransportError;
 use crate::transport::power::{InterfacePowerState, PowerManager};
@@ -219,6 +219,9 @@ pub struct TransportManager {
     /// Delay between BLE advertising retry attempts when advertising fails.
     #[cfg(feature = "ble")]
     ble_advertise_retry_delay: Duration,
+    /// BleCentral instance for MAC address randomization (privacy).
+    /// Used to track and rotate the local device's BLE scanning address.
+    ble_central_scanner: Option<BleCentral>,
 }
 
 impl TransportManager {
@@ -246,6 +249,7 @@ impl TransportManager {
             ble_conn_rx: None,
             #[cfg(feature = "ble")]
             ble_advertise_retry_delay: Duration::from_secs(30),
+            ble_central_scanner: None,
         }
     }
 
@@ -509,7 +513,9 @@ impl TransportManager {
         let retry_delay = self.ble_advertise_retry_delay;
 
         tokio::spawn(async move {
-            'outer: loop {
+            // Labeled block (not a loop): advertise once, then accept connections
+            // until shutdown or the inject channel closes via `break 'outer`.
+            'outer: {
                 // Retry advertising on failure with configurable delay.
                 loop {
                     let mut peripheral = BlePeripheral::new(local_peer.clone());
@@ -632,6 +638,15 @@ impl TransportManager {
 
         let decision = self.power_manager.tick(now);
         let mut flushed_transactions = 0usize;
+        let mut topology_flags = decision.topology_flags;
+
+        // Check for BLE MAC address rotation
+        if let Some(ble_central) = &mut self.ble_central_scanner {
+            if let Some(new_mac) = ble_central.rotate_mac_if_due() {
+                topology_flags.push(crate::message::types::TopologyFlag::MacRotated);
+                self.notify_mac_rotated(new_mac).await;
+            }
+        }
 
         if decision.wake_network {
             while let Some(pending) = self.pending_messages.pop_front() {
@@ -642,7 +657,7 @@ impl TransportManager {
 
         Ok(PowerTickOutcome {
             interface_state: decision.interface_state,
-            topology_flags: decision.topology_flags,
+            topology_flags,
             flushed_transactions,
         })
     }
@@ -671,6 +686,32 @@ impl TransportManager {
         }
 
         Err(TransportError::NotConnected)
+    }
+
+    /// Notify all connections that a BLE MAC address rotation has occurred.
+    ///
+    /// This method drops all existing BLE connections (as they reference the old MAC).
+    /// WiFi-Direct connections are unaffected and persist across the rotation.
+    pub async fn notify_mac_rotated(&mut self, new_mac: [u8; 6]) {
+        let ble_peers: Vec<[u8; 32]> = self
+            .active_connections
+            .iter()
+            .filter(|(_, c)| c.transport_type() == crate::transport::connection::TransportType::Ble)
+            .map(|(k, _)| *k)
+            .collect();
+
+        for pubkey in &ble_peers {
+            if let Some(mut conn) = self.active_connections.remove(pubkey) {
+                let _ = conn.disconnect().await;
+                self.peer_count.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        log::info!(
+            "MAC rotated to {:02X?}; dropped {} BLE connections",
+            new_mac,
+            ble_peers.len()
+        );
     }
 
     async fn ble_fallback(&mut self, peer: PeerIdentity) -> Result<(), TransportError> {
@@ -1247,5 +1288,122 @@ mod tests {
 
         // Reset for other tests.
         crate::transport::ble_transport::set_advertise_fail_count(0);
+    }
+
+    #[tokio::test]
+    async fn test_notify_mac_rotated_drops_ble_connections() {
+        use crate::transport::ble_transport::BleCentral;
+
+        let mut mgr = TransportManager::new(TransportPreference::Auto);
+        let peer1 = peer(0x11);
+        let peer2 = peer(0x22);
+
+        // Create mock BLE connections
+        let ble_conn = Box::new(BleCentral::new(peer1.clone()));
+        mgr.active_connections.insert(peer1.pubkey, ble_conn);
+        mgr.peer_count.fetch_add(1, Ordering::SeqCst);
+
+        let ble_conn2 = Box::new(BleCentral::new(peer2.clone()));
+        mgr.active_connections.insert(peer2.pubkey, ble_conn2);
+        mgr.peer_count.fetch_add(1, Ordering::SeqCst);
+
+        assert_eq!(mgr.connection_count(), 2);
+
+        // Call notify_mac_rotated
+        let new_mac = [0xAA, 0x02, 0x00, 0x00, 0x00, 0x00];
+        mgr.notify_mac_rotated(new_mac).await;
+
+        // All BLE connections should be dropped
+        assert_eq!(
+            mgr.connection_count(),
+            0,
+            "All BLE connections should be dropped after MAC rotation"
+        );
+        assert_eq!(mgr.peer_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_power_tick_includes_mac_rotated_flag() {
+        use crate::transport::ble_transport::BleCentral;
+
+        let mut mgr = TransportManager::new(TransportPreference::Auto);
+
+        // Create a BLE central with a very short rotation interval
+        let mut ble_central = BleCentral::new(peer(0x99));
+        ble_central = ble_central.with_rotation_interval(Duration::from_millis(1));
+        mgr.ble_central_scanner = Some(ble_central);
+
+        // Wait for the interval to elapse
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Call power_tick_at
+        let outcome = mgr.power_tick_at(Duration::from_secs(1)).await.unwrap();
+
+        // The outcome should include MacRotated flag
+        assert!(
+            outcome
+                .topology_flags
+                .contains(&crate::message::types::TopologyFlag::MacRotated),
+            "topology_flags should contain MacRotated after rotation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mac_rotated_flag_not_included_before_interval() {
+        use crate::transport::ble_transport::BleCentral;
+
+        let mut mgr = TransportManager::new(TransportPreference::Auto);
+
+        // Create a BLE central with a long rotation interval (default 15 minutes)
+        let ble_central = BleCentral::new(peer(0x88));
+        mgr.ble_central_scanner = Some(ble_central);
+
+        // Call power_tick_at immediately (interval has not elapsed)
+        let outcome = mgr.power_tick_at(Duration::from_secs(1)).await.unwrap();
+
+        // The outcome should NOT include MacRotated flag
+        assert!(
+            !outcome
+                .topology_flags
+                .contains(&crate::message::types::TopologyFlag::MacRotated),
+            "topology_flags should not contain MacRotated before interval elapses"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mac_rotation_drops_existing_ble_connections() {
+        use crate::transport::ble_transport::BleCentral;
+
+        let mut mgr = TransportManager::new(TransportPreference::Auto);
+
+        // Add a BLE connection
+        let peer1 = peer(0x77);
+        let ble_conn = Box::new(BleCentral::new(peer1.clone()));
+        mgr.active_connections.insert(peer1.pubkey, ble_conn);
+        mgr.peer_count.fetch_add(1, Ordering::SeqCst);
+
+        // Create a BLE central with a very short rotation interval
+        let mut ble_central = BleCentral::new(peer(0x66));
+        ble_central = ble_central.with_rotation_interval(Duration::from_millis(1));
+        mgr.ble_central_scanner = Some(ble_central);
+
+        // Wait for the interval to elapse
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Call power_tick_at
+        let outcome = mgr.power_tick_at(Duration::from_secs(1)).await.unwrap();
+
+        // Verify the flag is present and connection was dropped
+        assert!(
+            outcome
+                .topology_flags
+                .contains(&crate::message::types::TopologyFlag::MacRotated),
+            "topology_flags should contain MacRotated"
+        );
+        assert_eq!(
+            mgr.connection_count(),
+            0,
+            "BLE connections should be dropped after MAC rotation"
+        );
     }
 }
