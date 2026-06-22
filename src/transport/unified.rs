@@ -167,10 +167,16 @@ pub enum TransportPreference {
 // ─── TransportManager ─────────────────────────────────────────────────────────
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use tokio::sync::{mpsc, watch};
 
 use crate::message::types::ProtocolMessage;
 use crate::peer::identity::PeerIdentity;
 use crate::transport::ble_transport::BleCentral;
+#[cfg(feature = "ble")]
+use crate::transport::ble_transport::{decode_chunk, BlePeripheral};
 use crate::transport::connection::Connection;
 use crate::transport::errors::TransportError;
 use crate::transport::power::{InterfacePowerState, PowerManager};
@@ -197,6 +203,25 @@ pub struct TransportManager {
     active_connections: HashMap<[u8; 32], Box<dyn Connection>>,
     power_manager: PowerManager,
     pending_messages: VecDeque<PendingMessage>,
+    /// Maximum number of simultaneously connected peers.
+    pub max_peers: usize,
+    /// Atomic mirror of `active_connections.len()` shared with listener tasks.
+    peer_count: Arc<AtomicUsize>,
+    shutdown_tx: watch::Sender<bool>,
+    shutdown_rx: watch::Receiver<bool>,
+    /// Sender for injecting raw characteristic write data into the BLE listener.
+    /// Used in tests to simulate peripheral data reception.
+    #[cfg(feature = "ble")]
+    ble_inject_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// Receiver for inbound BLE connections that have completed the handshake.
+    #[cfg(feature = "ble")]
+    ble_conn_rx: Option<mpsc::Receiver<(PeerIdentity, Box<dyn Connection>)>>,
+    /// Delay between BLE advertising retry attempts when advertising fails.
+    #[cfg(feature = "ble")]
+    ble_advertise_retry_delay: Duration,
+    /// BleCentral instance for MAC address randomization (privacy).
+    /// Used to track and rotate the local device's BLE scanning address.
+    ble_central_scanner: Option<BleCentral>,
 }
 
 impl TransportManager {
@@ -208,11 +233,23 @@ impl TransportManager {
         preference: TransportPreference,
         power_manager: PowerManager,
     ) -> Self {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             preference,
             active_connections: HashMap::new(),
             power_manager,
             pending_messages: VecDeque::new(),
+            max_peers: 300,
+            peer_count: Arc::new(AtomicUsize::new(0)),
+            shutdown_tx,
+            shutdown_rx,
+            #[cfg(feature = "ble")]
+            ble_inject_tx: None,
+            #[cfg(feature = "ble")]
+            ble_conn_rx: None,
+            #[cfg(feature = "ble")]
+            ble_advertise_retry_delay: Duration::from_secs(30),
+            ble_central_scanner: None,
         }
     }
 
@@ -274,7 +311,9 @@ impl TransportManager {
             }
         };
 
-        self.active_connections.insert(peer.pubkey, conn);
+        if self.active_connections.insert(peer.pubkey, conn).is_none() {
+            self.peer_count.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -359,7 +398,9 @@ impl TransportManager {
                 }
                 Some(Ok(Err(TransportError::BrokenPipe))) => {
                     log::debug!("recv_any: BrokenPipe — falling back to BLE for peer");
-                    self.active_connections.remove(&pubkey);
+                    if self.active_connections.remove(&pubkey).is_some() {
+                        self.peer_count.fetch_sub(1, Ordering::SeqCst);
+                    }
                     let _ = self.ble_fallback(peer).await;
                 }
                 _ => continue,
@@ -374,6 +415,7 @@ impl TransportManager {
     pub async fn disconnect_peer(&mut self, pubkey: &[u8; 32]) -> bool {
         if let Some(mut conn) = self.active_connections.remove(pubkey) {
             let _ = conn.disconnect().await;
+            self.peer_count.fetch_sub(1, Ordering::SeqCst);
             true
         } else {
             false
@@ -382,10 +424,206 @@ impl TransportManager {
 
     /// Disconnect all active connections and clear the map.
     pub async fn shutdown(&mut self) {
+        let _ = self.shutdown_tx.send(true);
         for (_, mut conn) in self.active_connections.drain() {
             let _ = conn.disconnect().await;
         }
+        self.peer_count.store(0, Ordering::SeqCst);
         self.pending_messages.clear();
+    }
+
+    /// Bind a TCP listener on `0.0.0.0:{port}` and spawn a background task that
+    /// accepts inbound WiFi-Direct (TCP) connections, wraps each as a
+    /// `WifiDirectConnection`, and delivers `(PeerIdentity, Box<dyn Connection>)`
+    /// tuples over `incoming_tx`.
+    ///
+    /// Pass `port = 0` to let the OS pick an ephemeral port; the actual bound
+    /// address is returned so callers can advertise it via mDNS.
+    ///
+    /// Returns `Err(TransportError::ConnectionRefused)` if the port is already in use.
+    /// The background task stops when `shutdown()` is called.
+    pub async fn start_wifi_listener(
+        &self,
+        port: u16,
+        incoming_tx: mpsc::Sender<(PeerIdentity, Box<dyn Connection>)>,
+    ) -> Result<SocketAddr, TransportError> {
+        let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+            .await
+            .map_err(|_| TransportError::ConnectionRefused)?;
+        let bound_addr = listener
+            .local_addr()
+            .map_err(|_| TransportError::BrokenPipe)?;
+
+        let peer_count = Arc::clone(&self.peer_count);
+        let max_peers = self.max_peers;
+        let mut shutdown_rx = self.shutdown_rx.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => { break; }
+                    result = listener.accept() => {
+                        match result {
+                            Ok((stream, _)) => {
+                                if peer_count.load(Ordering::SeqCst) >= max_peers {
+                                    log::warn!(
+                                        "max_peers ({max_peers}) reached, dropping inbound connection"
+                                    );
+                                    drop(stream);
+                                    continue;
+                                }
+                                let placeholder = PeerIdentity::new(rand::random());
+                                let conn = WifiDirectConnection::from_stream(stream, placeholder.clone());
+                                let _ = incoming_tx.send((placeholder, Box::new(conn))).await;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(bound_addr)
+    }
+
+    /// Start accepting inbound BLE connections from Central devices.
+    ///
+    /// This method starts a background task that:
+    /// 1. Instantiates a `BlePeripheral` and calls `start_advertising()`.
+    /// 2. Waits for a Central to connect and send a `ProtocolMessage::Handshake`.
+    /// 3. Registers the connection in `self.connections` keyed by the Central's pubkey.
+    /// 4. Loops to accept the next inbound connection.
+    ///
+    /// Returns immediately after spawning the accept task.
+    #[cfg(feature = "ble")]
+    pub async fn start_ble_listener(
+        &mut self,
+        local_peer: PeerIdentity,
+    ) -> Result<(), TransportError> {
+        let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (conn_tx, conn_rx) = mpsc::channel::<(PeerIdentity, Box<dyn Connection>)>(64);
+
+        self.ble_inject_tx = Some(data_tx);
+        self.ble_conn_rx = Some(conn_rx);
+
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        let peer_count = Arc::clone(&self.peer_count);
+        let max_peers = self.max_peers;
+        let retry_delay = self.ble_advertise_retry_delay;
+
+        tokio::spawn(async move {
+            // Labeled block (not a loop): advertise once, then accept connections
+            // until shutdown or the inject channel closes via `break 'outer`.
+            'outer: {
+                // Retry advertising on failure with configurable delay.
+                loop {
+                    let mut peripheral = BlePeripheral::new(local_peer.clone());
+                    match peripheral.start_advertising().await {
+                        Ok(()) => break,
+                        Err(e) => {
+                            log::error!(
+                                "BLE advertising failed: {e:?}; retrying in ~{delay}s",
+                                delay = retry_delay.as_secs(),
+                            );
+                            tokio::time::sleep(retry_delay).await;
+                        }
+                    }
+                }
+
+                // Accept loop — reassemble one connection at a time.
+                let mut reassembler = MessageReassembler::new();
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_rx.changed() => break 'outer,
+                        data = data_rx.recv() => {
+                            match data {
+                                Some(bytes) => {
+                                    if peer_count.load(Ordering::SeqCst) >= max_peers {
+                                        log::warn!(
+                                            "max_peers ({max_peers}) reached, dropping inbound BLE"
+                                        );
+                                        continue;
+                                    }
+
+                                    // Decode chunk frame and try to complete a message.
+                                    let Some(frame) = decode_chunk(&bytes) else {
+                                        continue;
+                                    };
+                                    let Some(complete) = reassembler.receive_chunk(frame)
+                                        else {
+                                        continue;
+                                    };
+
+                                    match ProtocolMessage::from_bytes(&complete) {
+                                        Ok(ProtocolMessage::Handshake { pubkey }) => {
+                                            let central_peer = PeerIdentity::new(pubkey);
+                                            let conn: Box<dyn Connection> =
+                                                Box::new(BlePeripheral::new(central_peer.clone()));
+                                            let _ = conn_tx.send((central_peer, conn)).await;
+                                            // Reset for next connection.
+                                            reassembler = MessageReassembler::new();
+                                        }
+                                        _ => {
+                                            log::warn!(
+                                                "First BLE message was not a Handshake; \
+                                                 dropping connection"
+                                            );
+                                            reassembler = MessageReassembler::new();
+                                        }
+                                    }
+                                }
+                                None => break 'outer,
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Register an inbound connection accepted externally (e.g. from the gossip loop).
+    ///
+    /// Inserts `conn` into `active_connections` keyed by `peer.pubkey`, replacing
+    /// any existing stale connection.  If a new slot is consumed, `peer_count` is
+    /// incremented so the listener's backpressure check stays accurate.
+    pub fn register_inbound(&mut self, peer: PeerIdentity, conn: Box<dyn Connection>) {
+        if self.active_connections.insert(peer.pubkey, conn).is_none() {
+            self.peer_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Drain the BLE listener's completed-handshake channel and register any
+    /// ready-to-use connections into `active_connections`.
+    #[cfg(feature = "ble")]
+    fn process_ble_incoming(&mut self) {
+        let mut entries = Vec::new();
+        if let Some(rx) = &mut self.ble_conn_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok((peer, conn)) => entries.push((peer, conn)),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        self.ble_conn_rx = None;
+                        break;
+                    }
+                }
+            }
+        }
+        for (peer, conn) in entries {
+            self.register_inbound(peer, conn);
+        }
+    }
+
+    /// Return a clone of the BLE data injection sender, if the listener is running.
+    /// Used in tests to simulate characteristic writes from a Central.
+    #[cfg(feature = "ble")]
+    pub fn ble_inject(&self) -> Option<mpsc::Sender<Vec<u8>>> {
+        self.ble_inject_tx.clone()
     }
 
     pub async fn power_tick(&mut self) -> Result<PowerTickOutcome, TransportError> {
@@ -395,8 +633,20 @@ impl TransportManager {
     // ── Internal ─────────────────────────────────────────────────────────────
 
     async fn power_tick_at(&mut self, now: Duration) -> Result<PowerTickOutcome, TransportError> {
+        #[cfg(feature = "ble")]
+        self.process_ble_incoming();
+
         let decision = self.power_manager.tick(now);
         let mut flushed_transactions = 0usize;
+        let mut topology_flags = decision.topology_flags;
+
+        // Check for BLE MAC address rotation
+        if let Some(ble_central) = &mut self.ble_central_scanner {
+            if let Some(new_mac) = ble_central.rotate_mac_if_due() {
+                topology_flags.push(crate::message::types::TopologyFlag::MacRotated);
+                self.notify_mac_rotated(new_mac).await;
+            }
+        }
 
         if decision.wake_network {
             while let Some(pending) = self.pending_messages.pop_front() {
@@ -407,7 +657,7 @@ impl TransportManager {
 
         Ok(PowerTickOutcome {
             interface_state: decision.interface_state,
-            topology_flags: decision.topology_flags,
+            topology_flags,
             flushed_transactions,
         })
     }
@@ -422,7 +672,9 @@ impl TransportManager {
                 Ok(()) => return Ok(()),
                 Err(TransportError::BrokenPipe) => {
                     log::debug!("send_to: BrokenPipe — removing connection for peer");
-                    self.active_connections.remove(&peer.pubkey);
+                    if self.active_connections.remove(&peer.pubkey).is_some() {
+                        self.peer_count.fetch_sub(1, Ordering::SeqCst);
+                    }
                     self.ble_fallback(peer.clone()).await?;
                     if let Some(conn) = self.active_connections.get_mut(&peer.pubkey) {
                         return conn.send(msg).await;
@@ -436,11 +688,43 @@ impl TransportManager {
         Err(TransportError::NotConnected)
     }
 
+    /// Notify all connections that a BLE MAC address rotation has occurred.
+    ///
+    /// This method drops all existing BLE connections (as they reference the old MAC).
+    /// WiFi-Direct connections are unaffected and persist across the rotation.
+    pub async fn notify_mac_rotated(&mut self, new_mac: [u8; 6]) {
+        let ble_peers: Vec<[u8; 32]> = self
+            .active_connections
+            .iter()
+            .filter(|(_, c)| c.transport_type() == crate::transport::connection::TransportType::Ble)
+            .map(|(k, _)| *k)
+            .collect();
+
+        for pubkey in &ble_peers {
+            if let Some(mut conn) = self.active_connections.remove(pubkey) {
+                let _ = conn.disconnect().await;
+                self.peer_count.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        log::info!(
+            "MAC rotated to {:02X?}; dropped {} BLE connections",
+            new_mac,
+            ble_peers.len()
+        );
+    }
+
     async fn ble_fallback(&mut self, peer: PeerIdentity) -> Result<(), TransportError> {
         log::debug!("ble_fallback: connecting via BLE for peer");
         let mut c = BleCentral::new(peer.clone());
         c.connect().await?;
-        self.active_connections.insert(peer.pubkey, Box::new(c));
+        if self
+            .active_connections
+            .insert(peer.pubkey, Box::new(c))
+            .is_none()
+        {
+            self.peer_count.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(())
     }
 }
@@ -553,7 +837,8 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     };
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::mpsc;
 
     fn peer(b: u8) -> PeerIdentity {
         PeerIdentity::new([b; 32])
@@ -827,5 +1112,298 @@ mod tests {
         assert_eq!(tick.flushed_transactions, 1);
         assert_eq!(mgr.pending_message_count(), 0);
         assert_eq!(sent_messages.lock().unwrap().as_slice(), &[tx]);
+    }
+
+    // ── WiFi listener tests ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_wifi_listener_binds_and_accepts() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mgr = TransportManager::new(TransportPreference::BleOnly);
+        let addr = mgr.start_wifi_listener(0, tx).await.unwrap();
+
+        tokio::spawn(async move {
+            let _ = TcpStream::connect(addr).await;
+        });
+
+        let result = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+        assert!(result.is_ok(), "timed out waiting for inbound connection");
+        assert!(result.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_register_inbound_enables_send_to() {
+        let p = peer(0x55);
+        let recv_calls = Arc::new(AtomicUsize::new(0));
+        let sent_messages = Arc::new(Mutex::new(Vec::new()));
+        let inbox = Arc::new(Mutex::new(Vec::new()));
+
+        let mut mgr = TransportManager::new(TransportPreference::BleOnly);
+        mgr.register_inbound(
+            p.clone(),
+            Box::new(MockConnection::new(
+                p.clone(),
+                recv_calls,
+                sent_messages.clone(),
+                inbox,
+            )),
+        );
+        assert_eq!(mgr.connection_count(), 1);
+
+        let msg = sample_msg(42);
+        mgr.send_to(&p, msg.clone()).await.unwrap();
+        assert_eq!(sent_messages.lock().unwrap().as_slice(), &[msg]);
+    }
+
+    #[tokio::test]
+    async fn test_listener_rejects_beyond_max_peers() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut mgr = TransportManager::new(TransportPreference::BleOnly);
+        mgr.max_peers = 1;
+
+        let p = peer(0x77);
+        let recv_calls = Arc::new(AtomicUsize::new(0));
+        let sent_messages = Arc::new(Mutex::new(Vec::new()));
+        let inbox = Arc::new(Mutex::new(Vec::new()));
+        mgr.register_inbound(
+            p.clone(),
+            Box::new(MockConnection::new(
+                p.clone(),
+                recv_calls,
+                sent_messages,
+                inbox,
+            )),
+        );
+        assert_eq!(mgr.peer_count.load(Ordering::SeqCst), 1);
+
+        let addr = mgr.start_wifi_listener(0, tx).await.unwrap();
+
+        let _ = TcpStream::connect(addr).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "connection should have been dropped"
+        );
+    }
+
+    // ── BLE listener tests ───────────────────────────────────────────────────
+
+    #[cfg(feature = "ble")]
+    #[tokio::test]
+    async fn test_ble_listener_registers_connection_after_handshake() {
+        let local = peer(0xAA);
+        let central_pubkey = [0xBB; 32];
+        let mut mgr = TransportManager::new(TransportPreference::BleOnly);
+        mgr.ble_advertise_retry_delay = Duration::from_millis(5);
+        mgr.start_ble_listener(local).await.unwrap();
+
+        // Give the listener task time to start advertising.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Inject a Handshake — chunk it like a real BLE characteristic write.
+        let handshake = ProtocolMessage::Handshake {
+            pubkey: central_pubkey,
+        };
+        let bytes = rmp_serde::to_vec(&handshake).unwrap();
+        let chunker = MessageChunker { mtu: 4096 };
+        for frame in chunker.chunk(&bytes) {
+            let raw = crate::transport::ble_transport::encode_chunk(&frame);
+            mgr.ble_inject().unwrap().send(raw).await.unwrap();
+        }
+
+        // Give the listener time to process and register.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // process_ble_incoming is called inside power_tick_at, which recv_any_at
+        // invokes.  Call recv_any once to trigger the drain.
+        let _ = mgr.recv_any_at(Duration::from_secs(0)).await;
+
+        assert!(
+            mgr.active_connections.contains_key(&central_pubkey),
+            "Central's BlePeripheral should have been registered"
+        );
+        assert_eq!(mgr.connection_count(), 1);
+    }
+
+    #[cfg(feature = "ble")]
+    #[tokio::test]
+    async fn test_ble_listener_rejects_non_handshake_first_message() {
+        let local = peer(0xAA);
+        let mut mgr = TransportManager::new(TransportPreference::BleOnly);
+        mgr.ble_advertise_retry_delay = Duration::from_millis(5);
+        mgr.start_ble_listener(local).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Inject a Transaction as the first message (not a Handshake).
+        let tx = sample_transaction(1);
+        let bytes = rmp_serde::to_vec(&tx).unwrap();
+        let chunker = MessageChunker { mtu: 4096 };
+        for frame in chunker.chunk(&bytes) {
+            let raw = crate::transport::ble_transport::encode_chunk(&frame);
+            mgr.ble_inject().unwrap().send(raw).await.unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = mgr.recv_any_at(Duration::from_secs(0)).await;
+
+        // No connection should have been registered.
+        assert_eq!(mgr.connection_count(), 0);
+    }
+
+    #[cfg(feature = "ble")]
+    #[tokio::test]
+    async fn test_ble_listener_retries_on_advertising_failure() {
+        // Make start_advertising fail the first two calls, then succeed.
+        crate::transport::ble_transport::set_advertise_fail_count(2);
+
+        let local = peer(0xAA);
+        let central_pubkey = [0xCC; 32];
+        let mut mgr = TransportManager::new(TransportPreference::BleOnly);
+        mgr.ble_advertise_retry_delay = Duration::from_millis(5);
+        mgr.start_ble_listener(local).await.unwrap();
+
+        // Wait long enough for the two failures + retries + success.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Now inject a Handshake — the listener should be advertising.
+        let handshake = ProtocolMessage::Handshake {
+            pubkey: central_pubkey,
+        };
+        let bytes = rmp_serde::to_vec(&handshake).unwrap();
+        let chunker = MessageChunker { mtu: 4096 };
+        for frame in chunker.chunk(&bytes) {
+            let raw = crate::transport::ble_transport::encode_chunk(&frame);
+            mgr.ble_inject().unwrap().send(raw).await.unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = mgr.recv_any_at(Duration::from_secs(0)).await;
+
+        assert!(
+            mgr.active_connections.contains_key(&central_pubkey),
+            "Connection should be registered after advertising succeeds"
+        );
+
+        // Reset for other tests.
+        crate::transport::ble_transport::set_advertise_fail_count(0);
+    }
+
+    #[tokio::test]
+    async fn test_notify_mac_rotated_drops_ble_connections() {
+        use crate::transport::ble_transport::BleCentral;
+
+        let mut mgr = TransportManager::new(TransportPreference::Auto);
+        let peer1 = peer(0x11);
+        let peer2 = peer(0x22);
+
+        // Create mock BLE connections
+        let ble_conn = Box::new(BleCentral::new(peer1.clone()));
+        mgr.active_connections.insert(peer1.pubkey, ble_conn);
+        mgr.peer_count.fetch_add(1, Ordering::SeqCst);
+
+        let ble_conn2 = Box::new(BleCentral::new(peer2.clone()));
+        mgr.active_connections.insert(peer2.pubkey, ble_conn2);
+        mgr.peer_count.fetch_add(1, Ordering::SeqCst);
+
+        assert_eq!(mgr.connection_count(), 2);
+
+        // Call notify_mac_rotated
+        let new_mac = [0xAA, 0x02, 0x00, 0x00, 0x00, 0x00];
+        mgr.notify_mac_rotated(new_mac).await;
+
+        // All BLE connections should be dropped
+        assert_eq!(
+            mgr.connection_count(),
+            0,
+            "All BLE connections should be dropped after MAC rotation"
+        );
+        assert_eq!(mgr.peer_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_power_tick_includes_mac_rotated_flag() {
+        use crate::transport::ble_transport::BleCentral;
+
+        let mut mgr = TransportManager::new(TransportPreference::Auto);
+
+        // Create a BLE central with a very short rotation interval
+        let mut ble_central = BleCentral::new(peer(0x99));
+        ble_central = ble_central.with_rotation_interval(Duration::from_millis(1));
+        mgr.ble_central_scanner = Some(ble_central);
+
+        // Wait for the interval to elapse
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Call power_tick_at
+        let outcome = mgr.power_tick_at(Duration::from_secs(1)).await.unwrap();
+
+        // The outcome should include MacRotated flag
+        assert!(
+            outcome
+                .topology_flags
+                .contains(&crate::message::types::TopologyFlag::MacRotated),
+            "topology_flags should contain MacRotated after rotation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mac_rotated_flag_not_included_before_interval() {
+        use crate::transport::ble_transport::BleCentral;
+
+        let mut mgr = TransportManager::new(TransportPreference::Auto);
+
+        // Create a BLE central with a long rotation interval (default 15 minutes)
+        let ble_central = BleCentral::new(peer(0x88));
+        mgr.ble_central_scanner = Some(ble_central);
+
+        // Call power_tick_at immediately (interval has not elapsed)
+        let outcome = mgr.power_tick_at(Duration::from_secs(1)).await.unwrap();
+
+        // The outcome should NOT include MacRotated flag
+        assert!(
+            !outcome
+                .topology_flags
+                .contains(&crate::message::types::TopologyFlag::MacRotated),
+            "topology_flags should not contain MacRotated before interval elapses"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mac_rotation_drops_existing_ble_connections() {
+        use crate::transport::ble_transport::BleCentral;
+
+        let mut mgr = TransportManager::new(TransportPreference::Auto);
+
+        // Add a BLE connection
+        let peer1 = peer(0x77);
+        let ble_conn = Box::new(BleCentral::new(peer1.clone()));
+        mgr.active_connections.insert(peer1.pubkey, ble_conn);
+        mgr.peer_count.fetch_add(1, Ordering::SeqCst);
+
+        // Create a BLE central with a very short rotation interval
+        let mut ble_central = BleCentral::new(peer(0x66));
+        ble_central = ble_central.with_rotation_interval(Duration::from_millis(1));
+        mgr.ble_central_scanner = Some(ble_central);
+
+        // Wait for the interval to elapse
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Call power_tick_at
+        let outcome = mgr.power_tick_at(Duration::from_secs(1)).await.unwrap();
+
+        // Verify the flag is present and connection was dropped
+        assert!(
+            outcome
+                .topology_flags
+                .contains(&crate::message::types::TopologyFlag::MacRotated),
+            "topology_flags should contain MacRotated"
+        );
+        assert_eq!(
+            mgr.connection_count(),
+            0,
+            "BLE connections should be dropped after MAC rotation"
+        );
     }
 }

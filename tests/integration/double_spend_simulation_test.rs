@@ -19,6 +19,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use stellarconduit_core::message::types::TransactionEnvelope;
+use stellarconduit_core::metrics::Metrics;
 use stellarconduit_core::relay::{RelayNode, RpcError, StellarRpcClient};
 
 /// Mock RPC client that tracks submission count
@@ -68,7 +69,7 @@ impl TestNode {
             submission_count: rpc_submission_count.clone(),
         });
         let signing_key = SigningKey::from_bytes(&[node_id; 32]);
-        let relay = RelayNode::new(1000, rpc_client, signing_key);
+        let relay = RelayNode::new(1000, rpc_client, signing_key, Metrics::new());
         #[allow(clippy::arc_with_non_send_sync)]
         let relay_arc = Arc::new(tokio::sync::Mutex::new(relay));
 
@@ -85,7 +86,7 @@ impl TestNode {
             relay
                 .lock()
                 .await
-                .process_envelope(&envelope)
+                .process_envelope(&envelope, None)
                 .await
                 .map_err(|e| e.to_string())?;
         }

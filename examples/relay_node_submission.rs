@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use stellarconduit_core::message::types::TransactionEnvelope;
+use stellarconduit_core::metrics::Metrics;
 use stellarconduit_core::relay::{RelayNode, RpcError, StellarRpcClient};
 
 struct ExampleRpcClient;
@@ -46,7 +47,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
     let verifying_key = signing_key.verifying_key();
-    let mut relay = RelayNode::new(1000, Box::new(ExampleRpcClient), signing_key);
+    let mut relay = RelayNode::new(
+        1000,
+        Box::new(ExampleRpcClient),
+        signing_key,
+        Metrics::new(),
+    );
 
     let envelope = TransactionEnvelope {
         message_id: [1u8; 32],
@@ -61,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Origin: {:?}", hex::encode(&envelope.origin_pubkey[..8]));
     println!("Timestamp: {}", envelope.timestamp);
 
-    match relay.process_envelope(&envelope).await {
+    match relay.process_envelope(&envelope, None).await {
         Ok(proof) => {
             println!("✓ Transaction submitted successfully!");
             println!("Proof sequence: {}", proof.sequence);

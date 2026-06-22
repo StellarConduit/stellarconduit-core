@@ -7,10 +7,24 @@
 //! Unit tests cover state-machine and chunking logic only; BLE integration tests need a real adapter.
 
 use async_trait::async_trait;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+/// Test-only: number of consecutive times `BlePeripheral::start_advertising`
+/// should fail before succeeding.
+#[cfg(test)]
+static ADVERTISE_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Set the number of times `start_advertising` should fail (for testing retry logic).
+#[cfg(test)]
+pub fn set_advertise_fail_count(n: usize) {
+    ADVERTISE_FAIL_COUNT.store(n, Ordering::SeqCst);
+}
 
 use crate::message::types::ProtocolMessage;
 use crate::peer::identity::PeerIdentity;
@@ -34,6 +48,29 @@ pub const SC_NOTIFY_CHAR_UUID: Uuid =
 /// BLE MTU used for chunking. The BLE 4.2+ spec allows up to 517 bytes per ATT packet,
 /// but we use a conservative 244 bytes (common negotiated value).
 pub const BLE_ATT_MTU: usize = 244;
+
+// ─── MAC Address Provider ─────────────────────────────────────────────────────
+
+/// Trait for injectable MAC address generation.
+/// Allows pluggable MAC address providers for testing and platform-specific implementations.
+pub trait MacAddressProvider: Send + Sync {
+    /// Returns a 6-byte random MAC address with the locally-administered bit set.
+    /// The address must have bit 1 of byte 0 set (locally-administered bit).
+    fn generate(&self) -> [u8; 6];
+}
+
+/// Default implementation that generates random MAC addresses with the locally-administered bit set.
+pub struct RandomMacProvider;
+
+impl MacAddressProvider for RandomMacProvider {
+    fn generate(&self) -> [u8; 6] {
+        use rand::random;
+        let mut mac = random::<[u8; 6]>();
+        mac[0] |= 0b00000010; // Set locally-administered bit
+        mac[0] &= 0b11111110; // Clear multicast bit
+        mac
+    }
+}
 
 // ─── ChunkFrame wire encoding helpers ────────────────────────────────────────
 
@@ -117,6 +154,14 @@ impl BlePeripheral {
     ///
     /// Returns `Err(TransportError::ConnectionRefused)` if no BLE adapter is available.
     pub async fn start_advertising(&mut self) -> Result<(), TransportError> {
+        #[cfg(test)]
+        {
+            let prev = ADVERTISE_FAIL_COUNT.load(Ordering::SeqCst);
+            if prev > 0 {
+                ADVERTISE_FAIL_COUNT.store(prev - 1, Ordering::SeqCst);
+                return Err(TransportError::ConnectionRefused);
+            }
+        }
         // Platform integration: btleplug adapter acquisition would happen here.
         // For now we transition state to Connected to allow unit-testable logic.
         self.state = ConnectionState::Connected;
@@ -206,9 +251,14 @@ impl Connection for BlePeripheral {
 pub struct BleCentral {
     state: ConnectionState,
     remote_peer: PeerIdentity,
+    local_peer: PeerIdentity,
     chunker: MessageChunker,
     inbox_tx: mpsc::Sender<Vec<u8>>,
     inbox_rx: mpsc::Receiver<Vec<u8>>,
+    current_mac: [u8; 6],
+    mac_provider: Box<dyn MacAddressProvider>,
+    last_rotation: Instant,
+    rotation_interval: Duration,
 }
 
 impl BleCentral {
@@ -216,13 +266,60 @@ impl BleCentral {
     /// Call `connect()` (or `scan_and_connect()`) to begin scanning.
     pub fn new(remote_peer: PeerIdentity) -> Self {
         let (tx, rx) = mpsc::channel(64);
+        let mac_provider = Box::new(RandomMacProvider);
+        let initial_mac = mac_provider.generate();
         Self {
             state: ConnectionState::Disconnected,
             remote_peer,
+            local_peer: PeerIdentity::new([0u8; 32]),
             chunker: MessageChunker { mtu: BLE_ATT_MTU },
             inbox_tx: tx,
             inbox_rx: rx,
+            current_mac: initial_mac,
+            mac_provider,
+            last_rotation: Instant::now(),
+            rotation_interval: Duration::from_secs(15 * 60), // 15 minutes default
         }
+    }
+
+    /// Set the local peer identity so the Handshake is sent with the correct pubkey.
+    pub fn with_local_peer(mut self, local: PeerIdentity) -> Self {
+        self.local_peer = local;
+        self
+    }
+
+    /// Rotate the BLE Central's MAC address if the rotation interval has elapsed.
+    ///
+    /// Returns `Some(new_mac)` if a rotation occurred, or `None` if the interval has not yet elapsed.
+    /// The new MAC address has the locally-administered bit set (bit 1 of byte 0).
+    pub fn rotate_mac_if_due(&mut self) -> Option<[u8; 6]> {
+        if self.last_rotation.elapsed() >= self.rotation_interval {
+            let new_mac = self.mac_provider.generate();
+            self.current_mac = new_mac;
+            self.last_rotation = Instant::now();
+            Some(new_mac)
+        } else {
+            None
+        }
+    }
+
+    /// Set the MAC address provider for testing or platform-specific implementations.
+    #[cfg(test)]
+    pub fn with_mac_provider(mut self, provider: Box<dyn MacAddressProvider>) -> Self {
+        self.mac_provider = provider;
+        self
+    }
+
+    /// Set the rotation interval for testing.
+    #[cfg(test)]
+    pub fn with_rotation_interval(mut self, interval: Duration) -> Self {
+        self.rotation_interval = interval;
+        self
+    }
+
+    /// Get the current MAC address.
+    pub fn current_mac(&self) -> [u8; 6] {
+        self.current_mac
     }
 
     /// Scan for BLE peripherals advertising `SC_SERVICE_UUID` and connect to the one
@@ -235,11 +332,25 @@ impl BleCentral {
     /// 4. Connect to the matching peripheral, discover characteristics.
     /// 5. Subscribe to the Notify Characteristic, spawning a task that feeds inbound frames
     ///    to the inbox channel via `decode_chunk` / `MessageReassembler`.
+    /// 6. Send a `ProtocolMessage::Handshake` as the first message.
     ///
     /// Returns `Err(TransportError::ConnectionRefused)` if the target cannot be found.
     pub async fn scan_and_connect(&mut self) -> Result<(), TransportError> {
         // Platform integration: btleplug scan + connect would happen here.
         self.state = ConnectionState::Connected;
+
+        // Send Handshake as the first message after connecting.
+        let handshake = ProtocolMessage::Handshake {
+            pubkey: self.local_peer.pubkey,
+        };
+        let bytes = rmp_serde::to_vec(&handshake).map_err(|_| TransportError::BrokenPipe)?;
+        let frames = self.chunker.chunk(&bytes);
+        for frame in frames {
+            let _encoded = encode_chunk(&frame);
+            // Platform integration: write `_encoded` to the remote Peripheral's
+            // Write Characteristic via the btleplug central handle.
+        }
+
         Ok(())
     }
 
@@ -510,5 +621,110 @@ mod tests {
         // recv() should return the original message
         let received = p.recv().await.unwrap();
         assert_eq!(received, msg);
+    }
+
+    // ── MAC Address Randomization ─────────────────────────────────────────────
+
+    /// Mock MAC provider for testing that returns predictable values.
+    struct MockMacProvider {
+        counter: std::sync::atomic::AtomicU8,
+    }
+
+    impl MockMacProvider {
+        fn new() -> Self {
+            Self {
+                counter: std::sync::atomic::AtomicU8::new(0),
+            }
+        }
+    }
+
+    impl MacAddressProvider for MockMacProvider {
+        fn generate(&self) -> [u8; 6] {
+            let val = self
+                .counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            [val, 0x02, 0x00, 0x00, 0x00, 0x00] // locally-administered bit set
+        }
+    }
+
+    #[test]
+    fn test_random_mac_locally_administered_bit() {
+        let provider = RandomMacProvider;
+        for _ in 0..1000 {
+            let mac = provider.generate();
+            // Bit 1 of byte 0 should be set (locally-administered)
+            assert!(
+                mac[0] & 0b00000010 != 0,
+                "MAC {:02X?} missing locally-administered bit",
+                mac
+            );
+            // Bit 0 of byte 0 should be clear (unicast)
+            assert!(
+                mac[0] & 0b00000001 == 0,
+                "MAC {:02X?} has multicast bit set",
+                mac
+            );
+        }
+    }
+
+    #[test]
+    fn test_rotate_mac_returns_none_before_interval() {
+        let mut c = BleCentral::new(make_peer())
+            .with_mac_provider(Box::new(MockMacProvider::new()))
+            .with_rotation_interval(Duration::from_secs(60));
+
+        let result = c.rotate_mac_if_due();
+        assert_eq!(result, None, "Should return None before interval elapses");
+    }
+
+    #[test]
+    fn test_rotate_mac_returns_new_mac_after_interval() {
+        let c = BleCentral::new(make_peer());
+        let c = c
+            .with_mac_provider(Box::new(MockMacProvider::new()))
+            .with_rotation_interval(Duration::from_millis(1));
+
+        let initial_mac = c.current_mac();
+
+        // Sleep briefly to ensure the interval has elapsed
+        std::thread::sleep(Duration::from_millis(10));
+
+        let mut c = c; // rebind to allow mutable operation
+        let result = c.rotate_mac_if_due();
+        assert!(
+            result.is_some(),
+            "Should return Some after interval elapses"
+        );
+        let new_mac = result.unwrap();
+        assert_ne!(new_mac, initial_mac, "New MAC should differ from initial");
+    }
+
+    #[test]
+    fn test_rotate_mac_no_double_rotation() {
+        let c = BleCentral::new(make_peer());
+        let c = c
+            .with_mac_provider(Box::new(MockMacProvider::new()))
+            .with_rotation_interval(Duration::from_millis(1));
+
+        std::thread::sleep(Duration::from_millis(10));
+
+        let mut c = c;
+        let first_rotation = c.rotate_mac_if_due();
+        assert!(first_rotation.is_some());
+
+        let second_rotation = c.rotate_mac_if_due();
+        assert_eq!(
+            second_rotation, None,
+            "Second immediate rotation should return None"
+        );
+    }
+
+    #[test]
+    fn test_current_mac_getter() {
+        let c = BleCentral::new(make_peer());
+        let mac = c.current_mac();
+        assert_eq!(mac.len(), 6);
+        // Verify locally-administered bit is set
+        assert!(mac[0] & 0b00000010 != 0);
     }
 }

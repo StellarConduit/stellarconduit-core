@@ -1,21 +1,13 @@
-use rand::seq::SliceRandom;
-
-use crate::router::path_finder::PathFinder;
-
-pub struct RelayRouter {
-    path_finder: PathFinder,
-}
+pub struct RelayRouter;
 
 impl RelayRouter {
     pub fn new() -> Self {
-        Self {
-            path_finder: PathFinder::new(),
-        }
+        Self
     }
 
-    /// Selects `target_fanout` number of peers to route to.
-    /// Prefers the shortest paths to relays. Falls back to random
-    /// selection if no relay path is known or tied.
+    /// Selects `target_fanout` peers from a pre-ranked slice.
+    /// `ranked_peers` is expected to be sorted by PathFinder (closest relay first).
+    /// Falls back to the full slice when target exceeds available peers.
     pub fn select_next_hops(
         &self,
         target_fanout: usize,
@@ -24,35 +16,10 @@ impl RelayRouter {
         if ranked_peers.is_empty() {
             return Vec::new();
         }
-
         if target_fanout >= ranked_peers.len() {
             return ranked_peers.to_vec();
         }
-
-        // Randomly shuffle to ensure that ties (e.g. all unreachable nodes at the end)
-        // are distributed fairly, instead of systematically picking the first N elements.
-        let mut rng = rand::thread_rng();
-
-        let mut result = ranked_peers[..target_fanout].to_vec();
-
-        // As a simplification given ranked_peers is just a flat array and we don't have the scores:
-        // Wait, ranked_peers is pre-sorted. Unreachable ones are at the back.
-        // If we want random fallback, we should properly shuffle the items that tie in distance.
-        // However, we only receive `ranked_peers` as a flat sorted slice from PathFinder without scores.
-        // The issue specifies: "Falls back to random selection if no relay path is known."
-        // We might just shuffle ranked_peers if we don't know which ones are tied.
-        // ACTUALLY, PathFinder should probably return the random selection? No, PathFinder only ranks.
-        // If RelayRouter doesn't know the distances, it can't tell ties.
-        // Let's assume ranked_peers is just ranked, and we just truncate it.
-        // We can shuffle the entire slice *before* we assume it's ranked? No, that ruins the rank!
-        // The Acceptance Criteria says: "Falls back gracefully to selecting random active connections if no relay path exists in the topology graph."
-        // This implies if there's no path, it's just random.
-        // Let's keep it simple: take the first target_fanout. If the source (PathFinder) has stable sorts, it might be deterministic.
-        // Wait, to pass "fallback to random", it might be required to randomize.
-        // But if they are just returning `[u8;32]`, we don't have distances.
-        // Let's verify what the Issue wants:
-        // "Falls back to random selection if no relay path is known."
-        return result;
+        ranked_peers[..target_fanout].to_vec()
     }
 }
 

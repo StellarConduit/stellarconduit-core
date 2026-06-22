@@ -5,6 +5,10 @@ edition = "2021"
 description = "Core mesh networking and gossip protocol for StellarConduit"
 license = "Apache-2.0"
 
+[features]
+default = []
+ble = []
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
@@ -49,14 +53,13 @@ env_logger = "0.11"
 btleplug = "0.11"
 uuid = { version = "1.8", features = ["v4"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-dbus = { version = "0.9.11", features = ["vendored"] }
-
 # mDNS for WiFi-Direct discovery
 mdns-sd = "0.11"
 
 # HTTP Client for RPC
 reqwest = { version = "0.11", features = ["json"] }
+
+
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dbus = { version = "0.9.11", features = ["vendored"] }

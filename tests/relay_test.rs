@@ -4,6 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use stellarconduit_core::message::signing::verify_signature;
 use stellarconduit_core::message::types::TransactionEnvelope;
+use stellarconduit_core::metrics::Metrics;
 use stellarconduit_core::relay::{RelayNode, RpcError, StellarRpcClient};
 
 struct MockRpcClient {
@@ -81,9 +82,12 @@ async fn test_process_envelope_success() {
         1000,
         Box::new(MockRpcClient::new(&hex::encode(tx_id))),
         signing_key,
+        Metrics::new(),
     );
 
-    let result = relay.process_envelope(&create_envelope([2u8; 32])).await;
+    let result = relay
+        .process_envelope(&create_envelope([2u8; 32]), None)
+        .await;
 
     assert!(result.is_ok());
     let proof = result.unwrap();
@@ -98,8 +102,11 @@ async fn test_process_envelope_rpc_failure() {
         1000,
         Box::new(MockRpcClient::failing()),
         relay_signing_key(),
+        Metrics::new(),
     );
-    let result = relay.process_envelope(&create_envelope([2u8; 32])).await;
+    let result = relay
+        .process_envelope(&create_envelope([2u8; 32]), None)
+        .await;
     assert!(result.is_err());
 }
 
@@ -112,11 +119,12 @@ async fn test_process_envelope_deduplicates() {
         1000,
         Box::new(MockRpcClient::new(&hex::encode(tx_id))),
         signing_key,
+        Metrics::new(),
     );
     let envelope = create_envelope([2u8; 32]);
 
-    let proof1 = relay.process_envelope(&envelope).await.unwrap();
-    let proof2 = relay.process_envelope(&envelope).await.unwrap();
+    let proof1 = relay.process_envelope(&envelope, None).await.unwrap();
+    let proof2 = relay.process_envelope(&envelope, None).await.unwrap();
 
     assert_eq!(proof1, proof2);
     assert!(proof1.verify(&verifying_key, &tx_id));
