@@ -1322,7 +1322,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_power_tick_includes_mac_rotated_flag() {
-        use crate::transport::ble_transport::{BleCentral, RandomMacProvider};
+        use crate::transport::ble_transport::BleCentral;
 
         let mut mgr = TransportManager::new(TransportPreference::Auto);
 

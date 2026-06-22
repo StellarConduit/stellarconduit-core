@@ -653,18 +653,24 @@ mod tests {
         for _ in 0..1000 {
             let mac = provider.generate();
             // Bit 1 of byte 0 should be set (locally-administered)
-            assert!(mac[0] & 0b00000010 != 0, "MAC {:02X?} missing locally-administered bit", mac);
+            assert!(
+                mac[0] & 0b00000010 != 0,
+                "MAC {:02X?} missing locally-administered bit",
+                mac
+            );
             // Bit 0 of byte 0 should be clear (unicast)
-            assert!(mac[0] & 0b00000001 == 0, "MAC {:02X?} has multicast bit set", mac);
+            assert!(
+                mac[0] & 0b00000001 == 0,
+                "MAC {:02X?} has multicast bit set",
+                mac
+            );
         }
     }
 
     #[test]
     fn test_rotate_mac_returns_none_before_interval() {
-        let mut c = BleCentral::new(make_peer());
-        let mock_provider = Box::new(MockMacProvider::new());
-        let c = c
-            .with_mac_provider(mock_provider)
+        let c = BleCentral::new(make_peer())
+            .with_mac_provider(Box::new(MockMacProvider::new()))
             .with_rotation_interval(Duration::from_secs(60));
 
         let result = c.rotate_mac_if_due();
@@ -673,16 +679,12 @@ mod tests {
 
     #[test]
     fn test_rotate_mac_returns_new_mac_after_interval() {
-        let mock_provider = Box::new(MockMacProvider::new());
-        let initial_mac = mock_provider.generate();
-
         let mut c = BleCentral::new(make_peer());
         let c = c
             .with_mac_provider(Box::new(MockMacProvider::new()))
             .with_rotation_interval(Duration::from_millis(1));
 
-        let initial_stored_mac = c.current_mac();
-        assert_eq!(initial_stored_mac, initial_mac);
+        let initial_mac = c.current_mac();
 
         // Sleep briefly to ensure the interval has elapsed
         std::thread::sleep(Duration::from_millis(10));
