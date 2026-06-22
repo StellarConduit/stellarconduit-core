@@ -698,8 +698,8 @@ impl TransportManager {
             .map(|(k, _)| *k)
             .collect();
 
-        for pubkey in ble_peers {
-            if let Some(mut conn) = self.active_connections.remove(&pubkey) {
+        for pubkey in &ble_peers {
+            if let Some(mut conn) = self.active_connections.remove(pubkey) {
                 let _ = conn.disconnect().await;
                 self.peer_count.fetch_sub(1, Ordering::SeqCst);
             }

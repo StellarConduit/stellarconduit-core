@@ -679,7 +679,7 @@ mod tests {
 
     #[test]
     fn test_rotate_mac_returns_new_mac_after_interval() {
-        let mut c = BleCentral::new(make_peer());
+        let c = BleCentral::new(make_peer());
         let c = c
             .with_mac_provider(Box::new(MockMacProvider::new()))
             .with_rotation_interval(Duration::from_millis(1));
@@ -701,7 +701,7 @@ mod tests {
 
     #[test]
     fn test_rotate_mac_no_double_rotation() {
-        let mut c = BleCentral::new(make_peer());
+        let c = BleCentral::new(make_peer());
         let c = c
             .with_mac_provider(Box::new(MockMacProvider::new()))
             .with_rotation_interval(Duration::from_millis(1));
