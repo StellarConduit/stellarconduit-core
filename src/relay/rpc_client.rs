@@ -91,6 +91,50 @@ struct ResultCodes {
     transaction: Option<String>,
 }
 
+impl RpcClient {
+    /// Create a new RPC client with the given endpoint URL
+    ///
+    /// # Example
+    /// ```
+    /// use stellarconduit_core::relay::rpc_client::RpcClient;
+    ///
+    /// let client = RpcClient::new("https://soroban-testnet.stellar.org");
+    /// ```
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            http: Client::new(),
+        }
+    }
+
+    /// Submit a base64-encoded XDR transaction to the Soroban network.
+    ///
+    /// # Arguments
+    /// * `tx_xdr` - The base64-encoded Stellar transaction XDR
+    ///
+    /// # Returns
+    /// * `Ok(String)` - The transaction hash on successful submission
+    /// * `Err(RpcError)` - RPC error details if submission fails
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use stellarconduit_core::relay::rpc_client::RpcClient;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = RpcClient::new("https://soroban-testnet.stellar.org");
+    /// let tx_hash = client.submit_transaction("AAAAAgAAAAD...").await?;
+    /// println!("Transaction hash: {}", tx_hash);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn submit_transaction(&self, tx_xdr: &str) -> Result<String, RpcError> {
+        let request = SorobanRpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "sendTransaction",
+            params: SendTxParams {
+                transaction: tx_xdr.to_string(),
+            },
+        };
 // ---------- async trait impl ----------
 
 #[async_trait]
