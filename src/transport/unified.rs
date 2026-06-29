@@ -1323,6 +1323,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_notify_mac_rotated_drops_ble_keeps_wifi() {
+        use crate::transport::ble_transport::BleCentral;
+
+        // Minimal mock that reports as a WiFi-Direct connection. WiFi-Direct
+        // connections do not reference the BLE MAC, so they must survive a
+        // MAC rotation.
+        struct MockWifiConnection {
+            peer: PeerIdentity,
+        }
+
+        #[async_trait]
+        impl Connection for MockWifiConnection {
+            fn remote_peer(&self) -> PeerIdentity {
+                self.peer.clone()
+            }
+            fn transport_type(&self) -> TransportType {
+                TransportType::WifiDirect
+            }
+            fn state(&self) -> ConnectionState {
+                ConnectionState::Connected
+            }
+            async fn connect(&mut self) -> Result<(), TransportError> {
+                Ok(())
+            }
+            async fn send(&mut self, _msg: ProtocolMessage) -> Result<(), TransportError> {
+                Ok(())
+            }
+            async fn recv(&mut self) -> Result<ProtocolMessage, TransportError> {
+                Err(TransportError::BrokenPipe)
+            }
+            async fn disconnect(&mut self) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        let mut mgr = TransportManager::new(TransportPreference::Auto);
+        let ble_peer = peer(0x11);
+        let wifi_peer = peer(0x22);
+
+        // One BLE connection and one WiFi-Direct connection.
+        let ble_conn = Box::new(BleCentral::new(ble_peer.clone()));
+        mgr.active_connections.insert(ble_peer.pubkey, ble_conn);
+        mgr.peer_count.fetch_add(1, Ordering::SeqCst);
+
+        let wifi_conn = Box::new(MockWifiConnection {
+            peer: wifi_peer.clone(),
+        });
+        mgr.active_connections.insert(wifi_peer.pubkey, wifi_conn);
+        mgr.peer_count.fetch_add(1, Ordering::SeqCst);
+
+        assert_eq!(mgr.connection_count(), 2);
+
+        let new_mac = [0xAA, 0x02, 0x00, 0x00, 0x00, 0x00];
+        mgr.notify_mac_rotated(new_mac).await;
+
+        // The BLE connection is dropped; the WiFi-Direct connection is retained.
+        assert_eq!(
+            mgr.connection_count(),
+            1,
+            "WiFi-Direct connection should survive a MAC rotation"
+        );
+        assert!(
+            !mgr.active_connections.contains_key(&ble_peer.pubkey),
+            "BLE connection should be dropped after MAC rotation"
+        );
+        assert!(
+            mgr.active_connections.contains_key(&wifi_peer.pubkey),
+            "WiFi-Direct connection should remain after MAC rotation"
+        );
+        assert_eq!(mgr.peer_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn test_power_tick_includes_mac_rotated_flag() {
         use crate::transport::ble_transport::BleCentral;
 
