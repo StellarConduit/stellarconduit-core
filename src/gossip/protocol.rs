@@ -546,6 +546,14 @@ mod tests {
         );
     }
 
+    fn make_transport() -> Arc<Mutex<crate::transport::unified::TransportManager>> {
+        Arc::new(Mutex::new(
+            crate::transport::unified::TransportManager::new(
+                crate::transport::unified::TransportPreference::BleOnly,
+            ),
+        ))
+    }
+
     #[tokio::test]
     async fn test_gossip_loop_starts_without_blocking() {
         let scheduler = GossipScheduler::new();
