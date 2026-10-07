@@ -93,7 +93,7 @@ jobs:
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           echo "Checking out base commit $BASE_SHA"
           git checkout "$BASE_SHA"
-          cargo bench --bench gossip_bench -- --output-format bencher > /tmp/bench-base.txt
+          cargo bench --bench gossip_bench -- --output-format bencher > /tmp/bench-base.txt || true
 
       - name: Run benchmarks on PR head
         if: github.event_name == 'pull_request'
